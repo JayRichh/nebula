@@ -428,6 +428,7 @@ mod tests {
 
     /// A listener that answers every request the way ttyd does — with its
     /// `server:` header — on a port of the kernel's choosing.
+    #[cfg(unix)]
     fn fake_ttyd(status: &'static str) -> u16 {
         let listener = TcpListener::bind(SocketAddr::new(LOOPBACK, 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -453,6 +454,7 @@ mod tests {
     /// stub `nebula` first on PATH that answers nothing — so the version
     /// gate, if reached, fails with the "too old" message rather than
     /// launching anything.
+    #[cfg(unix)]
     fn run_remote_script(port: u16) -> (std::process::Child, tempfile::TempDir) {
         let home = tempfile::tempdir().unwrap();
         let stub = home.path().join("stub");
@@ -481,6 +483,7 @@ mod tests {
         (child, home)
     }
 
+    #[cfg(unix)]
     fn first_stderr_line(child: &mut Child) -> String {
         let stderr = child.stderr.take().unwrap();
         let mut line = String::new();
@@ -490,6 +493,7 @@ mod tests {
 
     /// The whole point: a server already on the port means "reuse it", said
     /// out loud, with the session held open — not a port clash.
+    #[cfg(unix)]
     #[test]
     fn the_script_reuses_a_ttyd_that_answers_on_the_port() {
         for status in ["200 OK", "401 Unauthorized"] {
@@ -511,6 +515,7 @@ mod tests {
 
     /// Nothing on the port: the probe stays quiet and the script goes on to
     /// start its own — here, into the version gate the stub nebula fails.
+    #[cfg(unix)]
     #[test]
     fn the_script_starts_its_own_when_nothing_answers() {
         let _port_guard = browser::port_test_guard();
