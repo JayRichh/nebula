@@ -113,20 +113,29 @@ const CURSOR_EVENTS: &[(&str, &str)] = &[
 /// `_hook <endpoint> <event>` subcommand instead, which does what the
 /// one-liner does: inert without the session env, the stdin payload POSTed
 /// to the daemon, the reply on stdout for `UserPromptSubmit` only, and
-/// cursor's `{"continue": true}` either way. The path is spelled with `/`,
-/// which every one of those shells runs unquoted; it is quoted only when
-/// it holds a space.
+/// cursor's `{"continue": true}` either way.
 #[cfg(windows)]
 fn hook_subcommand(endpoint: &str, event: &str) -> String {
     let exe = std::env::current_exe()
-        .map(|p| p.display().to_string().replace('\\', "/"))
+        .map(|p| shell_neutral_path(&p.display().to_string()))
         .unwrap_or_else(|_| "nebula".into());
-    let exe = if exe.contains(' ') {
-        format!("\"{exe}\"")
-    } else {
-        exe
-    };
     format!("{exe} {HOOK_SUBCOMMAND} {endpoint} {event}")
+}
+
+/// `path` spelled so bash, cmd and PowerShell all run it as the command
+/// word: `/` separators (bash eats a bare `\`), and the part after the
+/// drive quoted (spaces survive, and cmd reads no `/` as a switch) while
+/// the drive stays bare (PowerShell takes a line opening with a quote as a
+/// string, not a command): `C:"/Program Files/bro/bro.exe"`.
+#[cfg(windows)]
+fn shell_neutral_path(path: &str) -> String {
+    let path = path.strip_prefix(r"\\?\").unwrap_or(path).replace('\\', "/");
+    let bytes = path.as_bytes();
+    if bytes.len() > 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        format!("{}\"{}\"", &path[..2], &path[2..])
+    } else {
+        format!("\"{path}\"")
+    }
 }
 
 /// The hidden subcommand [`hook_subcommand`] runs, and what marks a
@@ -652,12 +661,16 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn hook_commands_run_the_hook_subcommand() {
-        let exe = std::env::current_exe()
-            .unwrap()
-            .display()
-            .to_string()
-            .replace('\\', "/");
-        let exe = if exe.contains(' ') { format!("\"{exe}\"") } else { exe };
+        let exe = shell_neutral_path(&std::env::current_exe().unwrap().display().to_string());
+        assert_eq!(
+            shell_neutral_path(r"C:\Program Files\bro\bro.exe"),
+            r#"C:"/Program Files/bro/bro.exe""#
+        );
+        assert_eq!(
+            shell_neutral_path(r"\\?\D:\b\bro.exe"),
+            r#"D:"/b/bro.exe""#
+        );
+        assert_eq!(shell_neutral_path(r"\\host\share\bro.exe"), r#""//host/share/bro.exe""#);
         assert_eq!(
             hook_command("claude", "UserPromptSubmit"),
             format!("{exe} _hook claude UserPromptSubmit")
