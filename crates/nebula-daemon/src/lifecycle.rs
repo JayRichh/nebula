@@ -30,7 +30,7 @@ pub struct PidfileLock {
 
 /// The file a Windows daemon holds its lock on, beside `pidfile`.
 pub fn lock_path(pidfile: &Path) -> PathBuf {
-    pidfile.with_extension("lock")
+    paths::lock_path_for(pidfile)
 }
 
 impl PidfileLock {

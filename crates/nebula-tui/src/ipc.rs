@@ -8,7 +8,9 @@ use nebula_core::{
     ReviewTabKind, ServerEvent, SessionRef, SessionSummary, TerminalId, TerminalTab, Worktree,
     WorktreeId, PROTOCOL_VERSION,
 };
+use crate::platform::Stream;
 use std::time::Duration;
+#[cfg(unix)]
 use tokio::net::UnixStream;
 
 /// Request id for the one-shot CLIs: each opens a fresh connection, sends a
@@ -21,7 +23,7 @@ const CLOSED_BEFORE_REPLY: &str = "daemon closed the connection before replying"
 const POLL_STEP: Duration = Duration::from_millis(50);
 
 pub struct Connection {
-    pub stream: UnixStream,
+    pub stream: Stream,
     pub daemon_pid: u32,
     pub protocol_version: u32,
 }
@@ -69,10 +71,40 @@ pub async fn connect_or_spawn() -> Result<Connection> {
     }
 }
 
-async fn try_connect(sock: &std::path::Path) -> Result<UnixStream> {
-    Ok(UnixStream::connect(sock).await?)
+async fn try_connect(sock: &std::path::Path) -> Result<Stream> {
+    Ok(crate::platform::connect(sock).await?)
 }
 
+/// Windows: a detached process with no console, in a process group of its
+/// own so the console's Ctrl+C never reaches it, and out of any job this
+/// client runs in (an IDE terminal's, say) when that job allows it — so the
+/// daemon outlives the client as it does on unix.
+#[cfg(windows)]
+fn spawn_daemon() -> Result<()> {
+    use std::os::windows::process::CommandExt;
+    use windows_sys::Win32::System::Threading::{
+        CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, DETACHED_PROCESS,
+    };
+    let exe = std::env::current_exe().context("resolve current_exe")?;
+    let flags = CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS | CREATE_NO_WINDOW;
+    let spawn = |flags: u32| {
+        std::process::Command::new(&exe)
+            .arg("daemon")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(flags)
+            .spawn()
+    };
+    // A job that forbids breakaway refuses the whole create; then the
+    // daemon stays in it.
+    spawn(flags | CREATE_BREAKAWAY_FROM_JOB)
+        .or_else(|_| spawn(flags))
+        .context("spawn nebula daemon")?;
+    Ok(())
+}
+
+#[cfg(unix)]
 fn spawn_daemon() -> Result<()> {
     use std::os::unix::process::CommandExt;
     let exe = std::env::current_exe().context("resolve current_exe")?;
@@ -97,6 +129,7 @@ fn spawn_daemon() -> Result<()> {
 /// `pre_exec` hook putting the child in a session of its own (`setsid`).
 /// Avoids a libc dependency for one call (same pattern as nebula-core's
 /// geteuid).
+#[cfg(unix)]
 pub(crate) fn own_session() -> std::io::Result<()> {
     extern "C" {
         fn setsid() -> i32;
@@ -107,7 +140,7 @@ pub(crate) fn own_session() -> std::io::Result<()> {
     Ok(())
 }
 
-async fn handshake(mut stream: UnixStream) -> Result<Connection> {
+async fn handshake(mut stream: Stream) -> Result<Connection> {
     // Asked of the kernel before the daemon gets a word in: a daemon on
     // another protocol hangs up right after its answer.
     let listener_pid = peer_pid(&stream);
@@ -143,9 +176,17 @@ async fn handshake(mut stream: UnixStream) -> Result<Connection> {
 /// The pid of the process listening on the far end of `stream`, from the
 /// kernel's peer credentials (`SO_PEERCRED`, `LOCAL_PEEREPID`) — which need
 /// neither a protocol the daemon speaks nor a pidfile that is still there.
+#[cfg(unix)]
 fn peer_pid(stream: &UnixStream) -> Option<i32> {
     let pid = stream.peer_cred().ok()?.pid()?;
     (pid > 1 && pid.unsigned_abs() != std::process::id()).then_some(pid)
+}
+
+/// Windows: the pipe server's pid, from `GetNamedPipeServerProcessId`.
+#[cfg(windows)]
+fn peer_pid(stream: &Stream) -> Option<i32> {
+    let pid = crate::platform::server_pid(stream)?;
+    (pid > 4 && pid != std::process::id()).then_some(pid as i32)
 }
 
 /// Explain a failed version handshake in terms of the fix.
@@ -205,6 +246,12 @@ fn version_skew_message(daemon_protocol_version: u32, daemon_pid: Option<i32>) -
 /// so adding a field to it would only break decoding on the clients that
 /// need this message most. The buildstamp beside the pidfile is no help
 /// either — it is a content hash, not a path.
+#[cfg(windows)]
+fn daemon_exe_path(pid: i32) -> Option<String> {
+    crate::platform::process_exe_path(pid as u32)
+}
+
+#[cfg(unix)]
 fn daemon_exe_path(pid: i32) -> Option<String> {
     if let Ok(path) = std::fs::read_link(format!("/proc/{pid}/exe")) {
         return Some(path.display().to_string());
@@ -226,7 +273,7 @@ pub struct IpcChannels {
 }
 
 pub fn split_connection(conn: Connection) -> IpcChannels {
-    let (read_half, mut write_half) = conn.stream.into_split();
+    let (read_half, mut write_half) = crate::platform::split(conn.stream);
     let (event_tx, event_rx) = tokio::sync::mpsc::channel::<ServerEvent>(1024);
     let (req_tx, mut req_rx) = tokio::sync::mpsc::channel::<ClientRequest>(256);
 
@@ -1124,6 +1171,7 @@ async fn kill_by_pidfile(path: &std::path::Path) -> Result<bool> {
 /// SIGTERM `pid`. A daemon that exits between being found and being
 /// signalled — mid-shutdown under a second `nebula kill` — has done what
 /// was asked, so only a process still running makes a failed signal an error.
+#[cfg(unix)]
 fn terminate(pid: i32) -> Result<()> {
     if send_signal(pid, SIGTERM) != 0 && process_running(pid) {
         bail!("failed to signal daemon pid {pid} — kill it manually");
@@ -1133,6 +1181,7 @@ fn terminate(pid: i32) -> Result<()> {
 
 /// Liveness = flock possession (mirrors the daemon's PidfileLock): if we can
 /// take the lock ourselves, nobody holds it. Released on drop.
+#[cfg(unix)]
 fn daemon_holds_pidfile_lock(path: &std::path::Path) -> bool {
     use std::os::fd::AsRawFd;
     let Ok(file) = std::fs::OpenOptions::new()
@@ -1162,6 +1211,7 @@ async fn wait_for_daemon_exit(pidfile: &std::path::Path, pid: i32) {
 /// Whether `pid` has yet to exit. A zombie still answers signal 0, but it
 /// has exited and holds nothing — it is only waiting for its parent to reap
 /// it, and a daemon's parent is whichever TUI spawned it, possibly still open.
+#[cfg(unix)]
 fn process_running(pid: i32) -> bool {
     if send_signal(pid, 0) != 0 {
         return false;
@@ -1185,7 +1235,41 @@ fn process_running(pid: i32) -> bool {
     }
 }
 
+/// Windows: there is no SIGTERM for a detached process, so a daemon this
+/// build cannot talk to is ended outright. Only reached once `Shutdown`
+/// over the pipe has failed — a daemon on another protocol.
+#[cfg(windows)]
+fn terminate(pid: i32) -> Result<()> {
+    let pid = pid as u32;
+    if nebula_core::platform::terminate_process(pid).is_err()
+        && nebula_core::platform::process_running(pid)
+    {
+        bail!("failed to stop daemon pid {pid} — end it from Task Manager");
+    }
+    Ok(())
+}
+
+/// Windows liveness mirrors the daemon's `PidfileLock`: the lock is on the
+/// sibling `daemon.lock`, and taking it ourselves means nobody holds it.
+#[cfg(windows)]
+fn daemon_holds_pidfile_lock(path: &std::path::Path) -> bool {
+    let Ok(file) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(paths::lock_path_for(path))
+    else {
+        return false;
+    };
+    matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock))
+}
+
+#[cfg(windows)]
+fn process_running(pid: i32) -> bool {
+    pid > 0 && nebula_core::platform::process_running(pid as u32)
+}
+
 // Tiny extern shims, same dep-light idiom as nebula_core::paths.
+#[cfg(unix)]
 fn flock_try_exclusive(fd: i32) -> i32 {
     extern "C" {
         fn flock(fd: i32, operation: i32) -> i32;
@@ -1195,8 +1279,10 @@ fn flock_try_exclusive(fd: i32) -> i32 {
     unsafe { flock(fd, LOCK_EX | LOCK_NB) }
 }
 
+#[cfg(unix)]
 const SIGTERM: i32 = 15;
 
+#[cfg(unix)]
 fn send_signal(pid: i32, sig: i32) -> i32 {
     extern "C" {
         fn kill(pid: i32, sig: i32) -> i32;
@@ -1255,12 +1341,14 @@ mod tests {
     }
 
     /// Env var that turns [`fake_skewed_daemon`] from a no-op into a daemon.
+    #[cfg(unix)]
     const FAKE_DAEMON_SOCK: &str = "NEBULA_TEST_FAKE_DAEMON_SOCK";
 
     /// A child re-exec of this test binary playing the daemon from #68: on
     /// an older protocol, with no pidfile, answering every `Hello` with
     /// `Incompatible` and hanging up — so only a signal stops it. A no-op
     /// when run any other way.
+    #[cfg(unix)]
     #[test]
     #[ignore = "run as a child process by kill_stops_a_skewed_daemon_whose_pidfile_is_gone"]
     fn fake_skewed_daemon() {
@@ -1288,8 +1376,10 @@ mod tests {
     }
 
     /// Kills the child if the test fails before it has exited.
+    #[cfg(unix)]
     struct Reap(std::process::Child);
 
+    #[cfg(unix)]
     impl Drop for Reap {
         fn drop(&mut self) {
             if !matches!(self.0.try_wait(), Ok(Some(_))) {
@@ -1303,6 +1393,7 @@ mod tests {
     // protocol this build doesn't, so neither `Shutdown` over the socket nor
     // SIGTERM via the pidfile can reach it — and `nebula kill` used to report
     // "no nebula daemon running" about a daemon still listening.
+    #[cfg(unix)]
     #[tokio::test]
     async fn kill_stops_a_skewed_daemon_whose_pidfile_is_gone() {
         use std::os::unix::process::ExitStatusExt;

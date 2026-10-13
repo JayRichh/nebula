@@ -1003,6 +1003,7 @@ mod tests {
     /// is stale, and an agent mid-`git add` or `commit` then fails with
     /// "index.lock: File exists" (issue #15). The poll must read without
     /// ever writing.
+    #[cfg(unix)]
     #[test]
     fn changed_files_never_rewrites_the_index() {
         use std::os::unix::fs::MetadataExt;

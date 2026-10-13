@@ -127,6 +127,13 @@ pub fn pidfile_path() -> PathBuf {
     runtime_dir().join("daemon.pid")
 }
 
+/// The file a Windows daemon holds its lock on, beside `pidfile`. Windows
+/// locks are mandatory — a locked file cannot be read through another
+/// handle — so the lock lives apart from the pid clients read.
+pub fn lock_path_for(pidfile: &Path) -> PathBuf {
+    pidfile.with_extension("lock")
+}
+
 /// Fingerprint of the binary the running daemon was launched from, written
 /// by the daemon at startup. Installers compare it against the binary they
 /// just installed to tell an up-to-date daemon from a stale one.

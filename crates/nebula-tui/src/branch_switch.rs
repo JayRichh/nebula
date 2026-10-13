@@ -238,14 +238,23 @@ fn read(root: &Path, args: &[&str]) -> Result<String, String> {
 /// calls that write or reach a remote — see the module docs for why none
 /// of them may find the TUI's terminal.
 fn detached(root: &Path, args: &[&str]) -> Command {
+    #[cfg(unix)]
     use std::os::unix::process::CommandExt;
     let mut cmd = git_command(root);
     cmd.args(args)
         .stdin(Stdio::null())
         .env("GIT_TERMINAL_PROMPT", "0");
     // SAFETY: setsid is async-signal-safe and touches nothing but the child.
+    #[cfg(unix)]
     unsafe {
         cmd.pre_exec(crate::ipc::own_session);
+    }
+    // Windows: no controlling terminal to steal; a console of its own,
+    // hidden, keeps a credential helper's prompt off the TUI's screen.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
     }
     cmd
 }
@@ -2262,10 +2271,14 @@ mod tests {
     }
 
     fn hook(repo: &Path, name: &str, body: &str) {
-        use std::os::unix::fs::PermissionsExt;
         let path = repo.join(".git/hooks").join(name);
         std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Git for Windows runs hooks through its own sh, mode or not.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
     }
 
     fn local(name: &str) -> Branch {

@@ -20,6 +20,7 @@ use crossterm::event::KeyboardEnhancementFlags;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::io::{BufWriter, Stdout, Write};
+#[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
@@ -154,6 +155,27 @@ pub(super) fn report_working_directory(
     Ok(())
 }
 
+/// Windows: the path as a `file://` URL path — `/C:/Users/…`, with `/` for
+/// `\` — encoded the same way. Windows paths are UTF-16, so there are no
+/// raw bytes to keep; the drive's `:` stays as it is.
+#[cfg(windows)]
+fn write_working_directory(w: &mut impl Write, path: &Path) -> std::io::Result<()> {
+    if !path.is_absolute() {
+        return Ok(());
+    }
+    w.write_all(b"\x1b]7;file://localhost/")?;
+    let text = path.to_string_lossy().replace('\\', "/");
+    for &byte in text.as_bytes() {
+        if byte.is_ascii_alphanumeric() || b"/-._~:".contains(&byte) {
+            w.write_all(&[byte])?;
+        } else {
+            write!(w, "%{byte:02X}")?;
+        }
+    }
+    w.write_all(b"\x1b\\")
+}
+
+#[cfg(unix)]
 fn write_working_directory(w: &mut impl Write, path: &Path) -> std::io::Result<()> {
     if !path.is_absolute() {
         return Ok(());
@@ -349,6 +371,7 @@ mod tests {
         assert!(sent.is_none());
     }
 
+    #[cfg(unix)]
     #[test]
     fn working_directory_encodes_url_delimiters_controls_and_non_utf8_bytes() {
         let path = Path::new(std::ffi::OsStr::from_bytes(

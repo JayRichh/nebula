@@ -281,9 +281,30 @@ pub(crate) fn spawn_open_command(command: &str, cwd: &std::path::Path) -> std::i
     if cfg!(test) {
         return Ok(());
     }
+    #[cfg(unix)]
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
     let shell = nebula_core::shell::user_shell();
+    // Windows: the user shell's own form of `-c`, and a hidden console of
+    // its own in place of the process group, so nothing it starts can
+    // write to the TUI's console.
+    #[cfg(windows)]
+    let mut child = {
+        use std::os::windows::process::CommandExt;
+        let args = nebula_core::shell::shell_line_args(&shell, command);
+        let launch =
+            nebula_core::shell::launch(&shell, &args).map_err(std::io::Error::other)?;
+        Command::new(&launch.program)
+            .args(&launch.args)
+            .envs(launch.env.iter().map(|(k, v)| (k, v)))
+            .current_dir(cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
+            .spawn()?
+    };
+    #[cfg(unix)]
     let mut child = Command::new(shell)
         .arg("-c")
         .arg(command)

@@ -1260,6 +1260,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "ulid",
+ "windows-sys",
 ]
 
 [[package]]
@@ -1284,6 +1285,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "vt100",
+ "windows-sys",
 ]
 
 [[package]]
@@ -1312,6 +1314,7 @@ dependencies = [
  "tui-term",
  "unicode-width",
  "vt100",
+ "windows-sys",
 ]
 
 [[package]]

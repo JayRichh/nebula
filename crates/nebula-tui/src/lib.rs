@@ -31,6 +31,7 @@ pub mod markdown;
 pub mod overlay_close;
 pub mod palette;
 pub mod perf;
+pub mod platform;
 pub mod pr_cache;
 pub mod pr_modal;
 pub mod pr_preview;
