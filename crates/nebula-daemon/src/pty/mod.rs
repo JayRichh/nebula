@@ -297,7 +297,10 @@ impl PtySession {
         // the env its command line may ride in (`shell::launch`).
         #[cfg(windows)]
         let launch = nebula_core::shell::launch(&spec.program, &spec.args)
-            .map_err(anyhow::Error::msg)
+            .map_err(|refused| {
+                tracing::warn!(program = %spec.program, %refused, "launch refused");
+                anyhow::Error::msg(refused)
+            })
             .with_context(|| format!("launch {}", spec.program))?;
         #[cfg(windows)]
         let (program, args) = (&launch.program, &launch.args);
