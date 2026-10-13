@@ -402,6 +402,16 @@ pub(crate) enum Command {
     /// reads, so a daemon asked to restart onto it knows it can.
     #[command(hide = true, name = "_restart-version")]
     RestartVersion,
+    /// Agent-CLI hook (the Windows hook command): POST the hook payload on
+    /// stdin to the daemon's hook receiver, as the unix `curl` one-liner
+    /// does. Inert outside a nebula agent session; always exits 0.
+    #[command(hide = true, name = "_hook")]
+    Hook {
+        /// The receiver route: claude, codex, cursor, pi or opencode.
+        endpoint: String,
+        /// The hook event, as the daemon names it (`Stop`, …).
+        event: String,
+    },
 }
 
 #[derive(Subcommand)]

@@ -116,6 +116,10 @@ pub struct TunnelOpts {
 }
 
 pub fn run_tunnel(opts: TunnelOpts) -> Result<()> {
+    // The remote half is `nebula browser`, which Windows lacks too.
+    if cfg!(windows) {
+        anyhow::bail!("`nebula tunnel` is not supported on Windows yet");
+    }
     let local = resolve_local_port(opts.port)?;
     let remote = opts.remote_port.unwrap_or(local);
     // The same list `nebula ssh` writes and the TUI's `Shift+H` picker reads — a

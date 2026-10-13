@@ -3,6 +3,10 @@
 //! install.sh already knows how to pick the right prebuilt binary, fall back
 //! to cargo, and report where it landed — this subcommand just saves the user
 //! from remembering the curl one-liner.
+//!
+//! Not on Windows yet: install.sh is a POSIX script, and there is no
+//! in-place restart to hand the daemon over with.
+#![cfg_attr(windows, allow(dead_code))]
 
 use anyhow::{bail, Context, Result};
 use nebula_core::{protocol_ranges_overlap, MIN_COMPATIBLE_PROTOCOL, PROTOCOL_VERSION};
@@ -57,6 +61,9 @@ fn restarted_note(sessions: usize) -> String {
 }
 
 pub fn run_upgrade(force: bool) -> Result<()> {
+    if cfg!(windows) {
+        bail!("`nebula upgrade` is not supported on Windows yet");
+    }
     let url = install_url();
     // The runtime dir is already the 0700 auth boundary; staging the script
     // there keeps it out of a world-writable /tmp before we execute it.
@@ -137,7 +144,15 @@ fn restart_onto_installed() -> bool {
     }
 }
 
+/// Windows: the first `nebula` the PATH + PATHEXT lookup finds.
+#[cfg(windows)]
+fn nebula_on_path(path: &OsStr) -> Option<PathBuf> {
+    let pathext = nebula_core::env::non_empty("PATHEXT").unwrap_or_else(|| ".EXE".into());
+    nebula_core::shell::resolve_program_in("nebula", path, &pathext)
+}
+
 /// The first executable `nebula` on `path` — the one the user runs next.
+#[cfg(unix)]
 fn nebula_on_path(path: &OsStr) -> Option<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
     std::env::split_paths(path)
@@ -320,6 +335,7 @@ mod tests {
         path
     }
 
+    #[cfg(unix)]
     fn staged_files(dir: &Path) -> Vec<String> {
         std::fs::read_dir(dir)
             .unwrap()
@@ -329,6 +345,7 @@ mod tests {
             .collect()
     }
 
+    #[cfg(unix)]
     #[test]
     fn runs_the_downloaded_script_then_cleans_up() {
         let tmp = tempfile::tempdir().unwrap();
@@ -347,6 +364,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_failing_installer_is_an_error() {
         let tmp = tempfile::tempdir().unwrap();
@@ -360,6 +378,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_missing_url_never_reaches_sh() {
         let tmp = tempfile::tempdir().unwrap();
@@ -370,6 +389,7 @@ mod tests {
         assert!(staged_files(tmp.path()).is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_non_script_payload_is_rejected() {
         let tmp = tempfile::tempdir().unwrap();
@@ -384,6 +404,7 @@ mod tests {
         assert!(staged_files(tmp.path()).is_empty());
     }
 
+    #[cfg(unix)]
     fn fake_nebula(dir: &Path, body: &str) {
         use std::os::unix::fs::PermissionsExt;
         let exe = dir.join("nebula");
@@ -391,6 +412,7 @@ mod tests {
         std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn reads_the_protocol_of_the_first_nebula_on_path() {
         let empty = tempfile::tempdir().unwrap();
@@ -406,6 +428,7 @@ mod tests {
         assert_eq!(protocol_version_on_path(&path, empty.path()), Some(44));
     }
 
+    #[cfg(unix)]
     #[test]
     fn reads_the_protocol_range_when_the_installed_binary_advertises_one() {
         let empty = tempfile::tempdir().unwrap();
@@ -428,6 +451,7 @@ mod tests {
         )));
     }
 
+    #[cfg(unix)]
     #[test]
     fn protocol_range_falls_back_to_exact_for_old_hooks() {
         let empty = tempfile::tempdir().unwrap();
@@ -445,6 +469,7 @@ mod tests {
     // `nebula <dir>`: an error when no such directory exists, a registered
     // project when one does. Either way it must come back "unknown", and the
     // probe must run where the caller says, not wherever `upgrade` was run.
+    #[cfg(unix)]
     #[test]
     fn a_nebula_without_the_hook_has_no_known_protocol() {
         let old = tempfile::tempdir().unwrap();

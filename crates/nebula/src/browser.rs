@@ -86,6 +86,10 @@ impl Default for BrowserOpts {
 }
 
 pub fn run_browser(opts: BrowserOpts) -> Result<()> {
+    // ttyd has no Windows build that can host a ConPTY client like this.
+    if cfg!(windows) {
+        anyhow::bail!("`nebula browser` is not supported on Windows yet");
+    }
     let port = resolve_port(opts.port, opts.bind)?;
     warn_if_exposed(&opts);
     let mut child = spawn_ttyd(&nebula_exe(), port, &opts)?;

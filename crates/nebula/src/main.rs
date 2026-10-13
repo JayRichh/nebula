@@ -1,5 +1,6 @@
 mod browser;
 mod cli;
+mod hook;
 mod ssh;
 mod tunnel;
 mod upgrade;
@@ -148,6 +149,7 @@ fn main() -> Result<()> {
             println!("{}", nebula_daemon::handoff::VERSION);
             Ok(())
         }
+        Some(Command::Hook { endpoint, event }) => hook::run_hook(&endpoint, &event),
         None => match cli.dir {
             Some(dir) => nebula_tui::run_add_project(dir),
             None => {

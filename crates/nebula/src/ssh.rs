@@ -10,9 +10,13 @@
 //! (install URL, start dir) is passed only as positional parameters, each
 //! POSIX-single-quoted. csh/tcsh login shells are the one unsupported case.
 
-use anyhow::{bail, Context, Result};
+#[cfg(unix)]
+use anyhow::Context;
+use anyhow::{bail, Result};
 use nebula_core::shell::single_quote;
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
+#[cfg(unix)]
 use std::process::Command;
 
 /// The opening half of every remote script: leave a usable `nebula` on the
@@ -62,6 +66,7 @@ pub(crate) use export_settings_bundle;
 /// Runs under `sh -c` on the remote: $1 = install URL, $2 = start dir
 /// (optional, may be empty; defaults to the remote $HOME), $3 = the settings
 /// bundle (optional).
+#[cfg_attr(windows, allow(dead_code))]
 const REMOTE_SCRIPT: &str = concat!(
     install_prelude!(),
     "cd -- \"${2:-$HOME}\" || exit 1; ",
@@ -69,6 +74,14 @@ const REMOTE_SCRIPT: &str = concat!(
     "exec nebula"
 );
 
+/// Not on Windows yet: it execs `ssh` over this process, which Windows has
+/// no way to do.
+#[cfg(windows)]
+pub fn run_ssh(_host: &str, _path: Option<&str>, _sync_config: bool) -> Result<()> {
+    bail!("`nebula ssh` is not supported on Windows yet")
+}
+
+#[cfg(unix)]
 pub fn run_ssh(host: &str, path: Option<&str>, sync_config: bool) -> Result<()> {
     // Remember the destination for the TUI's `Shift+H` picker. Before the exec on
     // purpose (there is no after); a host that fails to connect still lists,
@@ -85,6 +98,7 @@ pub fn run_ssh(host: &str, path: Option<&str>, sync_config: bool) -> Result<()> 
     Err(err).context("failed to exec ssh")
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 fn remote_command(install_url: &str, path: Option<&str>, bundle: Option<&str>) -> String {
     let mut cmd = format!(
         "sh -c '{}' nebula-ssh {}",
@@ -159,6 +173,7 @@ mod tests {
     /// The script run the way sshd runs it, with a stub `nebula` that
     /// records what it was handed: the bundle arrives as the variable, and a
     /// command without one leaves the variable unset.
+    #[cfg(unix)]
     #[test]
     fn the_bundle_reaches_the_remote_nebula_in_its_environment() {
         use std::os::unix::fs::PermissionsExt;

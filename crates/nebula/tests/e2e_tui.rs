@@ -8,6 +8,10 @@
 //!   j/k selection between worktrees → Enter into the sessions panel →
 //!   create an agent (auto-attach) → per-worktree session isolation →
 //!   j/k toggling between projects updates the worktree panel.
+//!
+//! Unix only: it drives the daemon over its unix socket and runs `/bin/sh`
+//! stand-ins for the agent CLIs.
+#![cfg(unix)]
 
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::io::{Read, Write};

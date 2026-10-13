@@ -1,6 +1,10 @@
 //! End-to-end daemon tests over the real IPC surface: entity CRUD, PTY
 //! attach/detach with scrollback replay, git worktree ops, and persistence
 //! across a daemon restart.
+//!
+//! Unix only: it drives the daemon over its unix socket and runs `/bin/sh`
+//! stand-ins for the agent CLIs.
+#![cfg(unix)]
 
 use nebula_core::codec::{read_frame, write_frame};
 use nebula_core::env;
