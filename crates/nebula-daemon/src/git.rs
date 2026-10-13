@@ -31,8 +31,18 @@ fn spawn_err(e: std::io::Error) -> anyhow::Error {
     }
 }
 
+/// A `git` command. On Windows it opens no console window: the daemon runs
+/// detached, with no console of its own for git to share.
+fn git_command() -> Command {
+    #[cfg_attr(unix, allow(unused_mut))]
+    let mut cmd = Command::new("git");
+    #[cfg(windows)]
+    cmd.creation_flags(nebula_core::platform::NO_WINDOW_FLAGS);
+    cmd
+}
+
 async fn git(repo: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(repo)
         .args(args)
@@ -370,7 +380,7 @@ async fn fetch_origin(repo: &Path) -> Result<()> {
 /// connection or a credential prompt with no tty degrades to the local
 /// fallback instead of wedging the worktree lock.
 async fn git_remote(repo: &Path, args: &[&str]) -> Result<String> {
-    let run = Command::new("git")
+    let run = git_command()
         .arg("-C")
         .arg(repo)
         .args(args)

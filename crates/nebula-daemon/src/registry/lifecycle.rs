@@ -514,6 +514,28 @@ impl Daemon {
                 ],
             ),
         };
+        // Windows: resolved and started as a PTY launch would be, with no
+        // console window of its own.
+        #[cfg(windows)]
+        let (program, args, launch_env, flags) = {
+            let launch = nebula_core::shell::launch(&program, &args).map_err(anyhow::Error::msg)?;
+            (
+                launch.program,
+                launch.args,
+                launch.env,
+                nebula_core::platform::NO_WINDOW_FLAGS,
+            )
+        };
+        #[cfg(windows)]
+        let output = tokio::process::Command::new(&program)
+            .args(&args)
+            .envs(launch_env)
+            .creation_flags(flags)
+            .current_dir(&worktree.path)
+            .output()
+            .await
+            .context("run claude -p --cloud")?;
+        #[cfg(unix)]
         let output = tokio::process::Command::new(&program)
             .args(&args)
             .current_dir(&worktree.path)

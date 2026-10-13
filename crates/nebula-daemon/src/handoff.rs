@@ -16,16 +16,27 @@
 //! the new image when it has taken the sessions over. The request travels
 //! outside the socket protocol on purpose: the client is usually the newer
 //! build, which a daemon on an older protocol would refuse to talk to.
+//!
+//! Windows has no exec-over-self to keep handles across, so there the
+//! daemon never advertises restarts and every request is refused with
+//! [`UNSUPPORTED`]: an upgrade stops the daemon, and sessions resume by id.
 
 use crate::lifecycle::PidfileLock;
+use crate::platform::RawFd;
 use crate::pty::Carried;
+#[cfg(unix)]
 use crate::registry::Daemon;
-use anyhow::{bail, Context, Result};
+use anyhow::bail;
+#[cfg(unix)]
+use anyhow::Context;
+use anyhow::Result;
 use nebula_core::{paths, AgentId, Worktree};
 use serde::{Deserialize, Serialize};
-use std::os::fd::{FromRawFd, RawFd};
+#[cfg(unix)]
+use std::os::fd::FromRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+#[cfg(unix)]
 use std::time::Duration;
 
 /// The state-file format this build writes, and the newest it reads. A
@@ -33,10 +44,17 @@ use std::time::Duration;
 /// its own, so a change that an older reader could misread bumps this.
 pub const VERSION: u32 = 2;
 
+/// Why an IN-PLACE RESTART is refused on Windows.
+#[cfg(windows)]
+pub const UNSUPPORTED: &str = "in-place restart is not supported on Windows";
+
 /// A request older than this is a leftover, not a client still waiting.
+#[cfg(unix)]
 const REQUEST_MAX_AGE_MS: i64 = 60_000;
 /// How long a client waits for the restart to be done.
+#[cfg(unix)]
 const OUTCOME_TIMEOUT: Duration = Duration::from_secs(20);
+#[cfg(unix)]
 const POLL_STEP: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -81,6 +99,7 @@ enum CarriedPendingMove {
     V1(AgentId, Worktree),
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 impl CarriedPendingMove {
     fn new(agent: AgentId, target: Worktree, notice: bool) -> Self {
         Self::V2(agent, target, notice)
@@ -94,6 +113,7 @@ impl CarriedPendingMove {
     }
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 #[derive(Serialize, Deserialize)]
 struct State {
     version: u32,
@@ -118,6 +138,7 @@ pub struct Handles {
 }
 
 /// What the new image takes over from the old one as it boots.
+#[cfg(unix)]
 pub struct Inherited {
     pub lock: PidfileLock,
     pub listener: std::os::unix::net::UnixListener,
@@ -150,6 +171,7 @@ impl Carry {
 
 /// Tell clients this daemon takes restart requests. Rewritten on the
 /// pidfile's refresh tick, for the same /tmp cleaner.
+#[cfg(unix)]
 pub fn advertise() {
     let _ = std::fs::write(
         paths::restart_capability_path(),
@@ -157,8 +179,13 @@ pub fn advertise() {
     );
 }
 
+/// A Windows daemon takes no restart requests, so it advertises nothing.
+#[cfg(windows)]
+pub fn advertise() {}
+
 /// The pending request, removed so it is answered once. None when there is
 /// none, it can't be read, or it is too old to have a client waiting.
+#[cfg(unix)]
 pub fn take_request() -> Option<Request> {
     let path = paths::restart_request_path();
     let text = std::fs::read_to_string(&path).ok()?;
@@ -171,6 +198,7 @@ pub fn take_request() -> Option<Request> {
 /// Exec `request.exe` over this process, handing it every live session.
 /// Only returns on failure, with this image still running and every
 /// session still its own.
+#[cfg(unix)]
 pub fn restart(daemon: &Arc<Daemon>, handles: &Handles, request: &Request) -> Result<()> {
     use std::os::unix::process::CommandExt;
     let exe = &request.exe;
@@ -244,6 +272,7 @@ pub fn restart(daemon: &Arc<Daemon>, handles: &Handles, request: &Request) -> Re
 /// The newest restart-state version `exe` reads. Run from the runtime dir:
 /// a build from before the hook reads the word as `nebula <dir>`, and no
 /// directory by that name will ever sit there to be added as a project.
+#[cfg(unix)]
 fn probe_version(exe: &Path) -> Option<u32> {
     let out = std::process::Command::new(exe)
         .arg("_restart-version")
@@ -260,6 +289,7 @@ fn probe_version(exe: &Path) -> Option<u32> {
 /// Read back what the old image wrote, and take ownership of the fds it
 /// kept open. Every fd taken here is close-on-exec again, ready for the
 /// next restart to choose what it keeps.
+#[cfg(unix)]
 pub fn inherit(state_path: &Path) -> Result<Inherited> {
     let bytes =
         std::fs::read(state_path).with_context(|| format!("read {}", state_path.display()))?;
@@ -342,8 +372,15 @@ pub enum Restart {
     Restarted { sessions: usize },
 }
 
+/// Windows: refused outright, whatever is running.
+#[cfg(windows)]
+pub fn request_restart(_exe: &Path) -> Result<Restart> {
+    bail!("{UNSUPPORTED}")
+}
+
 /// Ask the running daemon to restart in place onto `exe`, and wait until
 /// it has (or has said why not).
+#[cfg(unix)]
 pub fn request_restart(exe: &Path) -> Result<Restart> {
     if !PidfileLock::is_daemon_alive() {
         return Ok(Restart::NoDaemon);
@@ -397,13 +434,21 @@ pub fn request_restart(exe: &Path) -> Result<Restart> {
 }
 
 /// Whether the running daemon takes IN-PLACE RESTART requests.
+#[cfg(unix)]
 pub fn daemon_can_restart() -> bool {
     PidfileLock::is_daemon_alive() && restartable_daemon_pid().is_some()
+}
+
+/// A Windows daemon never does.
+#[cfg(windows)]
+pub fn daemon_can_restart() -> bool {
+    false
 }
 
 /// The pid of the running daemon when it advertises restarts, and the
 /// advertisement is its own — not one a dead daemon left behind for an
 /// older one now holding the pidfile.
+#[cfg(unix)]
 fn restartable_daemon_pid() -> Option<i32> {
     let advertised = std::fs::read_to_string(paths::restart_capability_path()).ok()?;
     let mut words = advertised.split_whitespace();
@@ -417,6 +462,7 @@ fn restartable_daemon_pid() -> Option<i32> {
     (pid > 1 && pid == holder && version >= 1).then_some(pid)
 }
 
+#[cfg(unix)]
 fn nonce() -> String {
     use rand::Rng;
     let mut bytes = [0u8; 16];

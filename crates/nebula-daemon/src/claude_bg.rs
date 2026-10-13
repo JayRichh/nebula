@@ -107,6 +107,44 @@ pub fn probe(program: &str, args: &[String], session_id: &str) -> Option<String>
     listed_background_id(&listing, session_id)
 }
 
+/// Windows: `program` is resolved and started the way a PTY spawn would
+/// (`nebula_core::shell::launch`), with no console window, and a timeout
+/// ends its process tree.
+#[cfg(windows)]
+fn run_captured(program: &str, args: &[String], timeout: Duration) -> Option<String> {
+    let launch = nebula_core::shell::launch(program, args).ok()?;
+    let mut command = Command::new(&launch.program);
+    command
+        .args(&launch.args)
+        .envs(launch.env.iter().map(|(k, v)| (k, v)))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    nebula_core::platform::no_window(&mut command);
+    let mut child = command.spawn().ok()?;
+    let mut stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut out = Vec::new();
+        let _ = stdout.read_to_end(&mut out);
+        out
+    });
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(PROBE_POLL),
+            _ => {
+                crate::platform::kill_tree(child.id());
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    let out = reader.join().ok()?;
+    Some(String::from_utf8_lossy(&out).into_owned())
+}
+
+#[cfg(unix)]
 fn run_captured(program: &str, args: &[String], timeout: Duration) -> Option<String> {
     use std::os::unix::process::CommandExt;
     let mut command = Command::new(program);
@@ -248,6 +286,7 @@ mod tests {
         assert!(!job_hint(config.path(), "../../..-8caa"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_probe_reads_a_real_commands_stdout() {
         let script = format!("cat <<'EOF'\n{LISTING}EOF");
@@ -260,6 +299,32 @@ mod tests {
         assert_eq!(probe("/nebula-test/no-such-shell", &[], SID), None);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn the_probe_reads_a_real_commands_stdout() {
+        let dir = tempfile::tempdir().unwrap();
+        let listing = dir.path().join("listing.json");
+        std::fs::write(&listing, LISTING).unwrap();
+        let args = vec!["/d".to_string(), "/c".to_string(), format!("type {}", listing.display())];
+        assert_eq!(probe("cmd.exe", &args, SID).as_deref(), Some("1a3138b9"));
+        let fail = vec!["/d".to_string(), "/c".to_string(), "exit 3".to_string()];
+        assert_eq!(probe("cmd.exe", &fail, SID), None);
+        assert_eq!(probe(r"C:\nebula-test\no-such-shell", &[], SID), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_hung_probe_is_killed_at_the_timeout() {
+        let started = Instant::now();
+        let args = vec!["/d".to_string(), "/c".to_string(), "ping -n 30 127.0.0.1".to_string()];
+        assert_eq!(
+            run_captured("cmd.exe", &args, Duration::from_millis(150)),
+            None
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[cfg(unix)]
     #[test]
     fn a_hung_probe_is_killed_at_the_timeout() {
         let started = Instant::now();

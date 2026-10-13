@@ -4,7 +4,9 @@
 use anyhow::{Context, Result};
 use nebula_core::paths;
 use std::fs::{self, OpenOptions};
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
+#[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -16,9 +18,19 @@ pub const RUNTIME_FILE_REFRESH: Duration = Duration::from_secs(60 * 60);
 
 /// Guard holding the exclusive pidfile flock for the daemon's lifetime.
 /// Lock possession — not file existence — is the liveness test.
+///
+/// On Windows the lock is `File::try_lock` (`LockFileEx`), which is
+/// mandatory: no other handle may read a locked range. So the lock sits on
+/// a sibling file ([`lock_path`]) and the pidfile stays plain text that
+/// clients can read.
 pub struct PidfileLock {
     file: std::fs::File,
     path: PathBuf,
+}
+
+/// The file a Windows daemon holds its lock on, beside `pidfile`.
+pub fn lock_path(pidfile: &Path) -> PathBuf {
+    pidfile.with_extension("lock")
 }
 
 impl PidfileLock {
@@ -29,6 +41,32 @@ impl PidfileLock {
         Self::acquire_at(&paths::pidfile_path())
     }
 
+    #[cfg(windows)]
+    fn acquire_at(path: &Path) -> Result<Option<Self>> {
+        let lock = lock_path(path);
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock)
+            .with_context(|| format!("open lockfile {}", lock.display()))?;
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(fs::TryLockError::WouldBlock) => return Ok(None),
+            Err(fs::TryLockError::Error(e)) => {
+                return Err(e).with_context(|| format!("lock {}", lock.display()))
+            }
+        }
+        // Informational only; liveness is the lock.
+        let _ = fs::write(path, format!("{}\n", std::process::id()));
+        Ok(Some(Self {
+            file,
+            path: path.to_path_buf(),
+        }))
+    }
+
+    #[cfg(unix)]
     fn acquire_at(path: &Path) -> Result<Option<Self>> {
         // No truncate: the flock decides ownership, content is informational.
         let file = OpenOptions::new()
@@ -57,6 +95,7 @@ impl PidfileLock {
     /// # Safety
     /// `fd` must be the pidfile fd that image named, open and owned by
     /// nothing else in this process.
+    #[cfg(unix)]
     pub unsafe fn inherit(fd: std::os::fd::RawFd) -> Self {
         use std::os::fd::FromRawFd;
         Self {
@@ -65,6 +104,7 @@ impl PidfileLock {
         }
     }
 
+    #[cfg(unix)]
     pub fn raw_fd(&self) -> std::os::fd::RawFd {
         self.file.as_raw_fd()
     }
@@ -92,7 +132,19 @@ impl PidfileLock {
         }
     }
 
+    /// Whether the pidfile is still where this guard wrote it. Windows locks
+    /// a sibling file it holds open, so only the pidfile can go missing —
+    /// and it is put back with this daemon's pid, the lock never left.
+    #[cfg(windows)]
+    fn still_at_path(&mut self) -> bool {
+        if !self.path.exists() {
+            let _ = fs::write(&self.path, format!("{}\n", std::process::id()));
+        }
+        lock_path(&self.path).exists()
+    }
+
     /// Whether the file at the pidfile path is the one this guard locked.
+    #[cfg(unix)]
     fn still_at_path(&self) -> bool {
         use std::os::unix::fs::MetadataExt;
         match (fs::metadata(&self.path), self.file.metadata()) {
@@ -111,6 +163,7 @@ impl PidfileLock {
     }
 }
 
+#[cfg(unix)]
 impl Drop for PidfileLock {
     fn drop(&mut self) {
         // flock released automatically on close; keep for explicitness.
@@ -118,6 +171,7 @@ impl Drop for PidfileLock {
     }
 }
 
+#[cfg(unix)]
 fn libc_flock(fd: i32) -> i32 {
     extern "C" {
         fn flock(fd: i32, operation: i32) -> i32;
@@ -183,7 +237,16 @@ fn fingerprint_file(path: &Path) -> Option<String> {
     Some(format!("{hash:016x}"))
 }
 
+/// Create the runtime dir. Windows has no mode to give it: the per-user
+/// profile it lives in is the boundary, and the pipe carries its own DACL.
+#[cfg(windows)]
+pub fn ensure_runtime_dir() -> Result<()> {
+    let dir = paths::runtime_dir();
+    fs::create_dir_all(&dir).with_context(|| format!("create runtime dir {}", dir.display()))
+}
+
 /// Create the runtime dir with 0700 perms — this is the auth boundary.
+#[cfg(unix)]
 pub fn ensure_runtime_dir() -> Result<()> {
     let dir = paths::runtime_dir();
     if !dir.exists() {
@@ -235,6 +298,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn refresh_touches_the_pidfile_it_still_holds() {
         use std::os::unix::fs::MetadataExt;
@@ -263,7 +327,10 @@ mod tests {
 
     // A second daemon that took the path after the first lost its file owns
     // the runtime files; the first must neither steal the pidfile back nor
-    // overwrite that daemon's buildstamp with its own.
+    // overwrite that daemon's buildstamp with its own. Unix only: a Windows
+    // daemon's lock is on a file of its own, which a deleted pidfile never
+    // frees for a second daemon to take.
+    #[cfg(unix)]
     #[test]
     fn refresh_yields_a_pidfile_another_daemon_holds() {
         let tmp = tempfile::tempdir().unwrap();

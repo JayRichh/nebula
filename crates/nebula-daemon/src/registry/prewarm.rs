@@ -245,7 +245,20 @@ impl Daemon {
         self.cli_available(program).await || self.probe_cli(program).await
     }
 
+    /// Windows: the spawn resolves the program through PATH + PATHEXT, so
+    /// the probe asks the same lookup directly — no shell to start, no
+    /// timeout to spend. Caches the answer.
+    #[cfg(windows)]
+    pub(super) async fn probe_cli(&self, program: &str) -> bool {
+        let ok = nebula_core::shell::resolve_program(program).is_some();
+        self.cli_probes
+            .lock()
+            .insert(program.to_string(), (ok, Instant::now()));
+        ok
+    }
+
     /// Uncached `command -v` through the user's login shell; caches the answer.
+    #[cfg(unix)]
     pub(super) async fn probe_cli(&self, program: &str) -> bool {
         let check = cli_probe_line(program);
         let mut probe = tokio::process::Command::new(nebula_core::shell::user_shell());

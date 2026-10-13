@@ -35,7 +35,9 @@
 //! env-guarded, so they remain inert in codex sessions outside nebula.
 
 use anyhow::{bail, Context, Result};
-use nebula_core::env::{AGENT_ID, API_TOKEN, API_URL};
+use nebula_core::env::AGENT_ID;
+#[cfg(unix)]
+use nebula_core::env::{API_TOKEN, API_URL};
 use serde_json::{json, Map, Value};
 use std::path::{Path, PathBuf};
 
@@ -52,6 +54,7 @@ const CURSOR_DIR: &str = ".cursor";
 const CODEX_DIR: &str = ".codex";
 /// How long a hook waits on the daemon. Hooks run inline in the agent's
 /// turn, so a hung daemon has to cost seconds, not a stuck session.
+#[cfg(unix)]
 const HOOK_CURL_TIMEOUT_SECS: u32 = 3;
 
 /// (hook event, optional matcher)
@@ -105,9 +108,56 @@ const CURSOR_EVENTS: &[(&str, &str)] = &[
     ("subagentStop", "SubagentStop"),
 ];
 
+/// Windows: no `curl` + POSIX `${VAR}` one-liner — the CLI may run its
+/// hooks under cmd, PowerShell or Git Bash. The hook is this binary's own
+/// `_hook <endpoint> <event>` subcommand instead, which does what the
+/// one-liner does: inert without the session env, the stdin payload POSTed
+/// to the daemon, the reply on stdout for `UserPromptSubmit` only, and
+/// cursor's `{"continue": true}` either way. The path is spelled with `/`,
+/// which every one of those shells runs unquoted; it is quoted only when
+/// it holds a space.
+#[cfg(windows)]
+fn hook_subcommand(endpoint: &str, event: &str) -> String {
+    let exe = std::env::current_exe()
+        .map(|p| p.display().to_string().replace('\\', "/"))
+        .unwrap_or_else(|_| "nebula".into());
+    let exe = if exe.contains(' ') {
+        format!("\"{exe}\"")
+    } else {
+        exe
+    };
+    format!("{exe} {HOOK_SUBCOMMAND} {endpoint} {event}")
+}
+
+/// The hidden subcommand [`hook_subcommand`] runs, and what marks a
+/// command as nebula's when an older install left it untagged.
+#[cfg(windows)]
+pub const HOOK_SUBCOMMAND: &str = "_hook";
+
+#[cfg(windows)]
+fn hook_command(endpoint: &str, event: &str) -> String {
+    hook_subcommand(endpoint, event)
+}
+
+#[cfg(windows)]
+fn cursor_hook_command(event: &str) -> String {
+    hook_subcommand("cursor", event)
+}
+
+#[cfg(windows)]
+fn is_nebula_command(cmd: Option<&Value>) -> bool {
+    cmd.and_then(Value::as_str)
+        .map(|c| {
+            (c.contains("/api/hooks/") && c.contains(AGENT_ID))
+                || c.contains(&format!(" {HOOK_SUBCOMMAND} "))
+        })
+        .unwrap_or(false)
+}
+
 /// The shell test every hook opens with. Outside nebula (a bare `claude`
 /// in the same checkout) the session env is absent and the hook must be
 /// inert — exit before curl ever runs.
+#[cfg(unix)]
 fn env_guard() -> String {
     format!("[ -z \"${AGENT_ID}\" ] || [ -z \"${API_URL}\" ]")
 }
@@ -115,6 +165,7 @@ fn env_guard() -> String {
 /// The POST itself, identical for every dialect: bearer auth, the hook's
 /// stdin payload passed straight through, and the agent id plus event
 /// name on the query string so the daemon needs nothing else to route it.
+#[cfg(unix)]
 fn hook_curl(endpoint: &str, event: &str) -> String {
     format!(
         "curl -sS -m {HOOK_CURL_TIMEOUT_SECS} -X POST -H \"Authorization: Bearer ${API_TOKEN}\" \
@@ -123,6 +174,7 @@ fn hook_curl(endpoint: &str, event: &str) -> String {
     )
 }
 
+#[cfg(unix)]
 fn hook_command(endpoint: &str, event: &str) -> String {
     // UserPromptSubmit passes the daemon's response body through to stdout:
     // Claude Code (and Codex, same dialect) add a hook's stdout to the
@@ -159,6 +211,7 @@ const CLAUDE_ALLOW_RULES: &[&str] = &[
 /// Cursor variant: the payload arrives on stdin like Claude's, but cursor
 /// expects a JSON response on stdout — `{"continue": true}` keeps gating
 /// events (beforeSubmitPrompt) flowing and is ignored by the rest.
+#[cfg(unix)]
 fn cursor_hook_command(event: &str) -> String {
     format!(
         "if {}; then printf '{{\"continue\": true}}\\n'; exit 0; fi; \
@@ -168,6 +221,7 @@ fn cursor_hook_command(event: &str) -> String {
     )
 }
 
+#[cfg(unix)]
 fn is_nebula_command(cmd: Option<&Value>) -> bool {
     cmd.and_then(Value::as_str)
         .map(|c| c.contains("/api/hooks/") && c.contains(AGENT_ID))
@@ -497,6 +551,7 @@ mod tests {
     /// The exact one-liners that land in users' config files. Pinned
     /// verbatim so the shared curl prelude can be factored without a byte
     /// of the installed command drifting.
+    #[cfg(unix)]
     #[test]
     fn hook_commands_are_spelled_exactly() {
         assert_eq!(
@@ -592,6 +647,28 @@ mod tests {
             .contains("hookEvent=PostToolUse"));
     }
 
+    /// Windows: the hook is this binary's `_hook` subcommand, the endpoint
+    /// and event as its words, and a legacy untagged one is still ours.
+    #[cfg(windows)]
+    #[test]
+    fn hook_commands_run_the_hook_subcommand() {
+        let exe = std::env::current_exe()
+            .unwrap()
+            .display()
+            .to_string()
+            .replace('\\', "/");
+        let exe = if exe.contains(' ') { format!("\"{exe}\"") } else { exe };
+        assert_eq!(
+            hook_command("claude", "UserPromptSubmit"),
+            format!("{exe} _hook claude UserPromptSubmit")
+        );
+        assert_eq!(cursor_hook_command("Stop"), format!("{exe} _hook cursor Stop"));
+        assert!(!hook_command("codex", "Stop").contains('\\'));
+        assert!(is_nebula_command(Some(&json!(hook_command("codex", "Stop")))));
+        assert!(!is_nebula_command(Some(&json!("my-own-hook Stop"))));
+    }
+
+    #[cfg(unix)]
     #[test]
     fn user_prompt_submit_command_pipes_response_to_stdout() {
         // The daemon's UserPromptSubmit response body is the auto-title

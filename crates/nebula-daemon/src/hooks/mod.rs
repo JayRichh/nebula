@@ -249,7 +249,8 @@ pub struct InheritedHooks {
 pub async fn start_hook_server(
     store: Arc<Store>,
     inherited: Option<InheritedHooks>,
-) -> anyhow::Result<(HookEnv, mpsc::Receiver<HookDelivery>, std::os::fd::RawFd)> {
+) -> anyhow::Result<(HookEnv, mpsc::Receiver<HookDelivery>, crate::platform::RawFd)> {
+    #[cfg(unix)]
     use std::os::fd::AsRawFd;
     let (listener, token) = match inherited {
         Some(InheritedHooks { listener, token }) => {
@@ -262,7 +263,11 @@ pub async fn start_hook_server(
         ),
     };
     let port = listener.local_addr()?.port();
+    #[cfg(unix)]
     let fd = listener.as_raw_fd();
+    // Nothing carries the listener across a restart on Windows.
+    #[cfg(windows)]
+    let fd = -1;
     let (tx, rx) = mpsc::channel(256);
 
     let state = Arc::new(HookServerState {

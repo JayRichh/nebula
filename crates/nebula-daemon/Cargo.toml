@@ -16,11 +16,22 @@ tracing = { workspace = true }
 portable-pty = { workspace = true }
 rusqlite = { version = "0.40", features = ["bundled"] }
 axum = "0.8"
-nix = { version = "0.31", features = ["process", "fs", "signal", "term"] }
 tokio-util = "0.7"
 rand = "0.10"
 subtle = "2"
 tempfile = { workspace = true }
 vt100 = { workspace = true }
 parking_lot = "0.12.5"
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", features = ["process", "fs", "signal", "term"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
 

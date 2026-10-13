@@ -61,6 +61,7 @@ struct ResumeWatch {
 /// terminal has. CLI probes use it directly, and PTY launches wrap it through
 /// [`LOGIN_SHELL_STDIN_SHIM`] below so rc-file startup sees stdin as non-TTY
 /// until nebula's command is about to run.
+#[cfg(unix)]
 const LOGIN_SHELL_ARGS: [&str; 3] = ["-l", "-i", "-c"];
 /// Tiny POSIX wrapper for PTY launches: keep stdout/stderr on the PTY, but
 /// give the login shell `/dev/null` as stdin while it sources rc files.
@@ -68,10 +69,12 @@ const LOGIN_SHELL_ARGS: [&str; 3] = ["-l", "-i", "-c"];
 /// autocomplete launchers) then leave the `-c` payload alone. The payload
 /// reopens `/dev/tty` before starting the agent, so the CLI itself remains
 /// fully interactive.
+#[cfg(unix)]
 const LOGIN_SHELL_STDIN_SHIM: &str = "exec </dev/null; exec \"$@\"";
 /// Cap on one CLI probe. A heavy rc file costs ~1s; a hung one must not
 /// stall a create forever, so on timeout the CLI is assumed present and
 /// the spawn itself gets to report.
+#[cfg(unix)]
 const CLI_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// A RUN TERMINAL whose command exited on its own: the PTY, kept for the
 /// replay, and the exit code the OS reported.
@@ -699,7 +702,20 @@ fn agent_has_detached_job(session: &PtySession) -> bool {
 
 /// Does this terminal's shell have any child processes (a command or job
 /// still running)? An unknown child pid or a failed probe counts as busy —
+/// never kill what can't be inspected. Windows asks the process table.
+#[cfg(windows)]
+fn shell_has_children(session: &PtySession) -> bool {
+    let Some(pid) = session.child_pid else {
+        return true;
+    };
+    let table = nebula_core::platform::process_table();
+    table.is_empty() || table.iter().any(|row| row.ppid == pid)
+}
+
+/// Does this terminal's shell have any child processes (a command or job
+/// still running)? An unknown child pid or a failed probe counts as busy —
 /// never kill what can't be inspected.
+#[cfg(unix)]
 fn shell_has_children(session: &PtySession) -> bool {
     let Some(pid) = session.child_pid else {
         return true;
@@ -753,6 +769,7 @@ pub(crate) fn normalize_url(url: &str) -> Result<String> {
 /// `pre_exec` hook putting the child in a session of its own (`setsid`):
 /// an interactive shell there cannot reach the daemon's controlling
 /// terminal, and the child leads a group a timeout can sweep.
+#[cfg(unix)]
 pub(crate) fn own_session() -> std::io::Result<()> {
     nix::unistd::setsid()
         .map(drop)
@@ -843,6 +860,7 @@ fn resolve_harness_in(
 /// foreground while the TUI around it stays coloured (#37). The spawn sets
 /// the same three against the daemon's inherited environment; this covers
 /// the profile's.
+#[cfg(unix)]
 fn login_shell_wrap(shell: &str, program: &str, args: &[String]) -> (String, Vec<String>) {
     let mut line = command_word(program);
     for arg in args {
@@ -855,6 +873,7 @@ fn login_shell_wrap(shell: &str, program: &str, args: &[String]) -> (String, Vec
 /// [`login_shell_wrap`] for a line that is already shell syntax — a RUN
 /// TERMINAL's `.nebula.json` `run`, pipes and `&&` and all — behind the
 /// same prelude.
+#[cfg(unix)]
 fn login_shell_line(shell: &str, line: &str) -> (String, Vec<String>) {
     let mut cmdline = String::from("exec </dev/tty; unset");
     for name in env::PANE_COLOR_OVERRIDES {
@@ -875,9 +894,31 @@ fn login_shell_line(shell: &str, line: &str) -> (String, Vec<String>) {
     ("/bin/sh".to_string(), args)
 }
 
+/// Windows: there is no login shell to wrap the launch in. The daemon's
+/// environment is already the user's (no profile adds to it the way
+/// ~/.zprofile does), the PTY spawn resolves `program` through PATH +
+/// PATHEXT and runs a `.cmd` or `.ps1` under its host
+/// (`nebula_core::shell::launch`), and `TERM`/`COLORTERM` are set on the
+/// spawn itself. So the launch is `program args…` as given.
+#[cfg(windows)]
+fn login_shell_wrap(_shell: &str, program: &str, args: &[String]) -> (String, Vec<String>) {
+    (program.to_string(), args.to_vec())
+}
+
+/// Windows [`login_shell_wrap`] for a line in the user shell's own syntax
+/// (a RUN TERMINAL's `run`): `-Command` for PowerShell, `/c` for cmd.
+#[cfg(windows)]
+fn login_shell_line(shell: &str, line: &str) -> (String, Vec<String>) {
+    (
+        shell.to_string(),
+        nebula_core::shell::shell_line_args(shell, line),
+    )
+}
+
 /// `program` as the command word of a shell line: bare when it is a plain
 /// name (letters, digits, `-`, `_`, `.`, `/`), since a quoted word is exempt
 /// from alias expansion in every shell; single-quoted otherwise.
+#[cfg(unix)]
 fn command_word(program: &str) -> String {
     let plain = !program.is_empty()
         && program
@@ -897,6 +938,7 @@ fn command_word(program: &str) -> String {
 /// bare a quote would close the word and run the rest as a command — at
 /// daemon boot, since [`Daemon::warm_cli_probes`] asks for every entry.
 /// Built-in names come out exactly as they always did (`'claude'`).
+#[cfg(unix)]
 fn cli_probe_line(program: &str) -> String {
     format!(
         "command -v {} >/dev/null 2>&1",
@@ -1904,6 +1946,7 @@ mod tests {
     /// A session still running in a checkout that has since been deleted
     /// keeps running through a restart that refuses: the check comes before
     /// the kill, so the restart never turns a live session into a dead one.
+    #[cfg(unix)]
     #[tokio::test]
     async fn restart_in_a_deleted_checkout_keeps_the_live_session() {
         let _cmd = EnvGuard::set(env::AGENT_CMD, "/bin/cat");
@@ -1981,9 +2024,11 @@ mod tests {
 
     /// What every agent launch runs once the login shell's files have run,
     /// ahead of the command itself.
+    #[cfg(unix)]
     const PANE_ENV: &str =
         "unset NO_COLOR FORCE_COLOR; export TERM=xterm-256color COLORTERM=truecolor;";
 
+    #[cfg(unix)]
     #[test]
     fn cli_probe_line_looks_the_program_up_verbatim() {
         // Built-ins read exactly as before the registry.
@@ -2016,6 +2061,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn login_shell_wrap_quotes_args_and_leaves_the_command_word_bare() {
         let (program, args) = login_shell_wrap(
@@ -2053,6 +2099,7 @@ mod tests {
     /// reason a launch goes through the login shell at all. A function
     /// stands in for the alias: every POSIX sh honours one in a `-c` string,
     /// and the old `exec env` form bypassed both alike.
+    #[cfg(unix)]
     #[test]
     fn login_shell_wrap_lets_the_shell_resolve_the_command() {
         let (_, args) = login_shell_wrap(
@@ -2080,6 +2127,7 @@ mod tests {
 
     /// The shape of the report itself: zsh, `-l -i -c`, and an alias in
     /// `.zshrc` that reroutes `claude`. Skipped where there is no zsh.
+    #[cfg(unix)]
     #[test]
     fn login_shell_wrap_honours_a_zshrc_alias() {
         use std::os::unix::process::CommandExt;
@@ -2128,6 +2176,7 @@ mod tests {
     /// overrides and restate the pane: run it through a plain `sh -c` with
     /// `NO_COLOR` and a foreign `TERM` already exported, as a `.profile`
     /// would leave them, and read back what the program sees.
+    #[cfg(unix)]
     #[test]
     fn login_shell_wrap_restates_the_pane_after_the_profile() {
         let (_, args) = login_shell_wrap(
@@ -2757,6 +2806,7 @@ mod tests {
     /// launch carries a task: the CLI submits it as it boots, and the
     /// session must not sit gray — and sort under everything mid-turn —
     /// for the seconds until its first hook lands.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_create_with_a_task_broadcasts_a_running_row() {
         let daemon = test_daemon();
@@ -3040,6 +3090,7 @@ mod tests {
     /// the grid and climb back — so the Stop is held at `running`, the
     /// respawn is seeded as a launch (its startup progress-clear swallowed),
     /// and only the relocated turn's own end finishes it.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_relocation_keeps_the_row_running_through_the_respawn() {
         let daemon = test_daemon();
@@ -3184,6 +3235,7 @@ mod tests {
     /// A live session: idle, it is respawned in the target at once; mid
     /// turn, it waits for the turn end and then resumes silent, so the
     /// held Stop finishes the row instead of a notice carrying it on.
+    #[cfg(unix)]
     #[tokio::test]
     async fn move_agent_relocates_an_idle_session_now_and_a_busy_one_at_turn_end() {
         let daemon = test_daemon();
@@ -3850,6 +3902,7 @@ mod tests {
         repo
     }
 
+    #[cfg(unix)]
     fn hook_script(dir: &Path, body: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let path = dir.join("hook.sh");
@@ -3889,6 +3942,7 @@ mod tests {
     /// The create hook runs once the checkout exists and its row is out,
     /// with the main repo and the new checkout as its arguments and the
     /// branch in its environment.
+    #[cfg(unix)]
     #[tokio::test]
     async fn create_worktree_runs_the_create_hook() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3978,6 +4032,7 @@ mod tests {
     /// The delete hook runs after the checkout is gone and the row is
     /// dropped, sees the deleted path, and its failure is a broadcast
     /// warning: the request still succeeds and the row stays gone.
+    #[cfg(unix)]
     #[tokio::test]
     async fn delete_worktree_runs_the_delete_hook_and_survives_its_failure() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4040,6 +4095,7 @@ mod tests {
     /// A create of the path a delete hook is still releasing waits for
     /// that hook: the delete hook sees the checkout gone (no "still on
     /// disk" skip), then the create hook runs, in that order.
+    #[cfg(unix)]
     #[tokio::test]
     async fn recreating_a_path_waits_for_its_delete_hook() {
         let tmp = tempfile::tempdir().unwrap();

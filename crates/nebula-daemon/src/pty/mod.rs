@@ -18,8 +18,10 @@ use question::QuestionScanner;
 use ring::ScrollbackRing;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use crate::platform::RawFd;
 use std::io::{Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 
@@ -38,6 +40,7 @@ const COALESCE_HOLD: std::time::Duration = std::time::Duration::from_millis(5);
 const READER_CHANNEL_BOUND: usize = 64;
 /// After the polite SIGHUP, how long the child gets to exit before its whole
 /// process group is SIGKILLed.
+#[cfg(unix)]
 const KILL_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 /// Size a session is spawned at when no client is attached to say better
 /// (prewarms, respawns after a move, restarts). The first attach resizes it
@@ -60,8 +63,17 @@ fn pty_size(cols: u16, rows: u16) -> PtySize {
     }
 }
 
+/// Windows has no process groups or sessions for a `ps` sweep to report,
+/// so the table is always "unknown" there: [`detached_job_under`] then
+/// counts every agent as busy, which keeps the idle reaper off it.
+#[cfg(windows)]
+fn ps_table() -> Option<String> {
+    None
+}
+
 /// The live process table, one process per line, as `ps -axo
 /// pid=,ppid=,pgid=,stat=` prints it; None when `ps` itself fails.
+#[cfg(unix)]
 fn ps_table() -> Option<String> {
     let out = std::process::Command::new("ps")
         .args(["-axo", "pid=,ppid=,pgid=,stat="])
@@ -128,6 +140,7 @@ fn descendants(rows: &[ProcRow], root: u32) -> Vec<&ProcRow> {
 /// named even when the `ps` sweep fails). An interactive shell running the
 /// agent as a job puts it in a group of its own; SIGKILLing the leader's
 /// group alone would miss it. Taken while the tree is intact — see `kill`.
+#[cfg_attr(windows, allow(dead_code))]
 fn process_groups_under(root: u32) -> Vec<u32> {
     process_groups_in_table(&ps_table().unwrap_or_default(), root)
 }
@@ -251,6 +264,11 @@ pub struct PtySession {
     /// Screen for answering cursor position reports; `None` until the child
     /// first asks, so sessions that never do parse nothing.
     cursor: Mutex<Option<CursorTracker>>,
+    /// The job object holding the child's process tree, which `kill` ends
+    /// in one call; `None` when the child could not be put in one (it is
+    /// then killed by pid tree instead).
+    #[cfg(windows)]
+    job: Option<crate::platform::Job>,
 }
 
 pub struct SpawnSpec {
@@ -274,8 +292,19 @@ impl PtySession {
             .openpty(pty_size(spec.cols, spec.rows))
             .context("openpty")?;
 
-        let mut cmd = CommandBuilder::new(&spec.program);
-        cmd.args(&spec.args);
+        // Windows has no shell in front of the child to resolve its name
+        // or run a script: `launch` turns the spec into an executable and
+        // the env its command line may ride in (`shell::launch`).
+        #[cfg(windows)]
+        let launch = nebula_core::shell::launch(&spec.program, &spec.args)
+            .map_err(anyhow::Error::msg)
+            .with_context(|| format!("launch {}", spec.program))?;
+        #[cfg(windows)]
+        let (program, args) = (&launch.program, &launch.args);
+        #[cfg(unix)]
+        let (program, args) = (&spec.program, &spec.args);
+        let mut cmd = CommandBuilder::new(program);
+        cmd.args(args);
         cmd.cwd(&spec.cwd);
         // The child paints nebula's grid, not the terminal the daemon was
         // started from: name that grid and drop the colour overrides the
@@ -292,7 +321,12 @@ impl PtySession {
         for (k, v) in &spec.env {
             cmd.env(k, v);
         }
+        #[cfg(windows)]
+        for (k, v) in &launch.env {
+            cmd.env(k, v);
+        }
 
+        #[cfg_attr(windows, allow(unused_mut))]
         let mut child = pair
             .slave
             .spawn_command(cmd)
@@ -300,15 +334,32 @@ impl PtySession {
         drop(pair.slave);
 
         let child_pid = child.process_id();
+        #[cfg(windows)]
+        let job = child
+            .as_raw_handle()
+            .and_then(|process| match crate::platform::Job::for_process(process) {
+                Ok(job) => Some(job),
+                Err(e) => {
+                    tracing::warn!(error = %e, pid = ?child_pid, "child left out of a job object");
+                    None
+                }
+            });
         let reader = pair.master.try_clone_reader().context("clone pty reader")?;
         let writer = pair.master.take_writer().context("take pty writer")?;
+        #[cfg(unix)]
         let reap: Reap = Box::new(move || child.wait().ok().map(|st| st.exit_code() as i32));
+        #[cfg(unix)]
+        let master = pair.master;
+        // ConPTY keeps the output pipe open after the child exits, for as
+        // long as the pseudoconsole lives, so EOF alone never ends a session.
+        #[cfg(windows)]
+        let (master, reap) = watch_conpty_exit(pair.master, child);
 
         Ok(Self::start(
             Self {
                 sref,
                 writer: Mutex::new(writer),
-                master: Mutex::new(pair.master),
+                master: Mutex::new(master),
                 child_pid,
                 ring: Mutex::new(ScrollbackRing::new(RING_CAPACITY)),
                 events: broadcast::channel(256).0,
@@ -319,15 +370,25 @@ impl PtySession {
                 cloud: Mutex::new(None),
                 question: Mutex::new(None),
                 cursor: Mutex::new(None),
+                #[cfg(windows)]
+                job,
             },
             reader,
             reap,
         ))
     }
 
+    /// Windows has no IN-PLACE RESTART, so there is never a session to take
+    /// over.
+    #[cfg(windows)]
+    pub fn adopt(_carried: Carried) -> Result<Arc<Self>> {
+        anyhow::bail!("{}", crate::handoff::UNSUPPORTED)
+    }
+
     /// Take over a session an earlier image of this daemon ran, from what
     /// [`Self::carry`] wrote down: the master fd survived the exec, and the
     /// child is still this process's child, so it is reaped as before.
+    #[cfg(unix)]
     pub fn adopt(carried: Carried) -> Result<Arc<Self>> {
         // SAFETY: the fd was named by the image that exec'd us, which held it
         // open across the exec for exactly this; nothing else here owns it.
@@ -391,6 +452,7 @@ impl PtySession {
     /// exec. None for a session with no child pid to reap. Output the
     /// reader has read but the pump has not yet added to the ring is lost;
     /// the attach that follows repaints the screen anyway.
+    #[cfg(unix)]
     pub fn carry(&self) -> Result<Option<Carried>> {
         let (Some(pid), Some(master_fd)) = (self.child_pid, self.master.lock().as_raw_fd()) else {
             return Ok(None);
@@ -416,11 +478,21 @@ impl PtySession {
 
     /// Undo [`Self::carry`]'s hold on the master fd: the exec it was for
     /// failed, and this image keeps running.
+    #[cfg(unix)]
     pub fn uncarry(&self) {
         if let Some(fd) = self.master.lock().as_raw_fd() {
             let _ = set_cloexec(fd, true);
         }
     }
+
+    /// No IN-PLACE RESTART on Windows: nothing is ever carried.
+    #[cfg(windows)]
+    pub fn carry(&self) -> Result<Option<Carried>> {
+        Ok(None)
+    }
+
+    #[cfg(windows)]
+    pub fn uncarry(&self) {}
 
     pub fn write_input(&self, data: &[u8]) -> Result<()> {
         let mut w = self.writer.lock();
@@ -463,6 +535,7 @@ impl PtySession {
     /// pump task, and the 1MB ring all pinned forever) — including an agent
     /// the login shell forked into a job group of its own, which a kill of
     /// the leader's group alone would leave running with its pane gone.
+    #[cfg(unix)]
     pub fn kill(&self) {
         // Subscribe before signalling so an immediate exit can't be missed.
         let mut rx = self.events.subscribe();
@@ -550,6 +623,21 @@ impl PtySession {
                 }
             })
             .expect("spawn pty kill watchdog");
+    }
+
+    /// End the child and everything it started. Windows has no hangup to
+    /// send first — a console child gets its close event when the
+    /// pseudoconsole goes, which is after it exits — so the session's job
+    /// object is terminated outright, or the pid tree when there is no job.
+    /// The exit watcher then closes the console and the reader sees EOF.
+    #[cfg(windows)]
+    pub fn kill(&self) {
+        let Some(pid) = self.child_pid else { return };
+        let ended = self.job.as_ref().map(|job| job.terminate());
+        if !matches!(ended, Some(Ok(()))) {
+            tracing::warn!(session = ?self.sref, pid, ?ended, "no job to end — killing the pid tree");
+            crate::platform::kill_tree(pid);
+        }
     }
 
     /// Ring snapshot for attach replay: (base_seq, bytes).
@@ -699,8 +787,71 @@ pub struct Carried {
 /// Blocks until the child exits; its exit code, when the OS gave one.
 type Reap = Box<dyn FnOnce() -> Option<i32> + Send>;
 
+/// A ConPTY master the exit watcher can close: [`watch_conpty_exit`] drops
+/// the real one when the child exits, which closes the pseudoconsole and so
+/// the output pipe the reader thread is blocked on.
+#[cfg(windows)]
+struct ClosableMaster(Arc<Mutex<Option<Box<dyn MasterPty + Send>>>>);
+
+#[cfg(windows)]
+impl ClosableMaster {
+    fn with<T>(&self, f: impl FnOnce(&dyn MasterPty) -> anyhow::Result<T>) -> anyhow::Result<T> {
+        match self.0.lock().as_deref() {
+            Some(master) => f(master),
+            None => anyhow::bail!("the pseudoconsole is closed"),
+        }
+    }
+}
+
+#[cfg(windows)]
+impl MasterPty for ClosableMaster {
+    fn resize(&self, size: PtySize) -> anyhow::Result<()> {
+        self.with(|m| m.resize(size))
+    }
+
+    fn get_size(&self) -> anyhow::Result<PtySize> {
+        self.with(|m| m.get_size())
+    }
+
+    fn try_clone_reader(&self) -> anyhow::Result<Box<dyn Read + Send>> {
+        self.with(|m| m.try_clone_reader())
+    }
+
+    fn take_writer(&self) -> anyhow::Result<Box<dyn Write + Send>> {
+        self.with(|m| m.take_writer())
+    }
+}
+
+/// Wait for the child on a thread of its own, then close the pseudoconsole
+/// so the reader thread reaches EOF. The returned reap hands the reader the
+/// exit code the watcher saw.
+#[cfg(windows)]
+fn watch_conpty_exit(
+    master: Box<dyn MasterPty + Send>,
+    mut child: Box<dyn portable_pty::Child + Send + Sync>,
+) -> (Box<dyn MasterPty + Send>, Reap) {
+    let console = Arc::new(Mutex::new(Some(master)));
+    let closer = console.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("pty-exit-watch".into())
+        .stack_size(256 * 1024)
+        .spawn(move || {
+            let exit_code = child.wait().ok().map(|st| st.exit_code() as i32);
+            let _ = tx.send(exit_code);
+            // Taken out of the lock first: dropping it may block until the
+            // reader has drained what the console still had to say.
+            let master = closer.lock().take();
+            drop(master);
+        })
+        .expect("spawn pty exit watcher");
+    let reap: Reap = Box::new(move || rx.recv().ok().flatten());
+    (Box::new(ClosableMaster(console)), reap)
+}
+
 /// `waitpid` for a child this image did not spawn, but inherited across an
 /// exec. A signal death reads as 1, the code portable-pty gives it.
+#[cfg(unix)]
 fn reap_pid(pid: u32) -> Option<i32> {
     use nix::sys::wait::{waitpid, WaitStatus};
     let pid = nix::unistd::Pid::from_raw(pid as i32);
@@ -714,6 +865,7 @@ fn reap_pid(pid: u32) -> Option<i32> {
     }
 }
 
+#[cfg(unix)]
 pub(crate) fn set_cloexec(fd: RawFd, on: bool) -> Result<()> {
     use nix::fcntl::{fcntl, FcntlArg, FdFlag};
     // SAFETY: only ever called on an fd this process holds open.
@@ -726,16 +878,19 @@ pub(crate) fn set_cloexec(fd: RawFd, on: bool) -> Result<()> {
 
 /// A PTY master inherited across an exec, where portable-pty has no way to
 /// wrap an fd it did not open itself.
+#[cfg(unix)]
 struct AdoptedMaster {
     fd: OwnedFd,
 }
 
+#[cfg(unix)]
 impl AdoptedMaster {
     fn dup(&self) -> anyhow::Result<std::fs::File> {
         Ok(std::fs::File::from(self.fd.try_clone()?))
     }
 }
 
+#[cfg(unix)]
 impl MasterPty for AdoptedMaster {
     fn resize(&self, size: PtySize) -> anyhow::Result<()> {
         let ws = nix::libc::winsize {
@@ -1018,6 +1173,7 @@ mod tests {
     /// than the ring holds — claude, a long session later — still has it on
     /// a screen rebuilt from the replay, and the replay ends on the ring's
     /// last byte (#107).
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_wrapped_replay_keeps_bracketed_paste() {
         let session = PtySession::spawn(
@@ -1065,6 +1221,7 @@ mod tests {
 
     /// A window title set by the child reaches subscribers as its own
     /// event, and the session remembers it.
+    #[cfg(unix)]
     #[tokio::test]
     async fn window_title_is_read_off_the_output() {
         let session = PtySession::spawn(
@@ -1104,6 +1261,7 @@ mod tests {
     /// The pane is nebula's grid, not the terminal the daemon was started
     /// from: every child hears `TERM`/`COLORTERM` for that grid, and a
     /// `NO_COLOR` or `FORCE_COLOR` the daemon inherited never reaches it.
+    #[cfg(unix)]
     #[tokio::test]
     async fn child_is_told_the_pane_is_a_truecolor_terminal() {
         // The daemon's own environment is the base the child is built from,
@@ -1163,6 +1321,76 @@ mod tests {
     /// A child asking where its cursor is — crossterm's `cursor::position()`,
     /// which timed out inside nebula before (#66) — is answered from the
     /// screen as it stood at the query, not after the rest of the chunk.
+    /// ConPTY holds its output pipe open after the child exits; the session
+    /// must still end, with the child's output and exit code.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_conpty_child_that_exits_ends_its_session() {
+        let session = PtySession::spawn(
+            SessionRef::Agent(AgentId::generate()),
+            SpawnSpec {
+                program: "cmd.exe".into(),
+                args: vec!["/d".into(), "/c".into(), "echo bro-pty-ok& exit 3".into()],
+                cwd: std::env::temp_dir(),
+                env: vec![],
+                scrub_env: &[],
+                cols: DEFAULT_COLS,
+                rows: DEFAULT_ROWS,
+            },
+        )
+        .unwrap();
+        let mut rx = session.events.subscribe();
+        let code = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                match rx.recv().await {
+                    Ok(PtyEvent::Exited { exit_code }) => break exit_code,
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(e) => panic!("event stream ended: {e}"),
+                }
+            }
+        })
+        .await
+        .expect("child exits within 10s");
+        assert_eq!(code, Some(3));
+        let (_, bytes) = session.snapshot(None);
+        let out = String::from_utf8_lossy(&bytes);
+        assert!(out.contains("bro-pty-ok"), "child printed: {out:?}");
+    }
+
+    /// `kill` ends the child's whole tree through its job object.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn kill_ends_a_conpty_child() {
+        let session = PtySession::spawn(
+            SessionRef::Agent(AgentId::generate()),
+            SpawnSpec {
+                program: "cmd.exe".into(),
+                args: vec!["/d".into(), "/k".into()],
+                cwd: std::env::temp_dir(),
+                env: vec![],
+                scrub_env: &[],
+                cols: DEFAULT_COLS,
+                rows: DEFAULT_ROWS,
+            },
+        )
+        .unwrap();
+        assert!(session.job.is_some(), "the child runs in a job");
+        let mut rx = session.events.subscribe();
+        session.kill();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                match rx.recv().await {
+                    Ok(PtyEvent::Exited { .. }) => break,
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(e) => panic!("event stream ended: {e}"),
+                }
+            }
+        })
+        .await
+        .expect("killed child exits within 10s");
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn cursor_position_query_is_answered_from_the_screen() {
         let session = PtySession::spawn(

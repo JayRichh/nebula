@@ -755,7 +755,15 @@ impl Daemon {
             Some(command) => login_shell_line(&nebula_core::shell::user_shell(), command),
             // `-l` makes it a login shell, matching Terminal.app: zsh then
             // sources /etc/zprofile (path_helper), ~/.zprofile, and ~/.zshrc.
+            #[cfg(unix)]
             None => (nebula_core::shell::user_shell(), vec!["-l".into()]),
+            // Windows shells take no `-l`; pwsh just drops its banner.
+            #[cfg(windows)]
+            None => {
+                let shell = nebula_core::shell::user_shell();
+                let args = nebula_core::shell::interactive_shell_args(&shell);
+                (shell, args)
+            }
         };
         let spec = SpawnSpec {
             program,

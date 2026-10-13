@@ -1,4 +1,5 @@
-//! Unix-socket server: accept loop and per-client request handling. The
+//! Unix-socket (Windows: named-pipe) server: accept loop and per-client
+//! request handling. The
 //! PTY plane of a connection (attach replay, forwarding) lives in `attach`.
 
 use crate::attach::{self, PaneSize};
@@ -9,7 +10,8 @@ use nebula_core::codec::{read_frame, write_frame};
 use nebula_core::{ClientRequest, ServerEvent, SessionRef, PROTOCOL_VERSION};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::io::{AsyncWriteExt, BufWriter};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufWriter};
+#[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, mpsc};
 
@@ -17,6 +19,33 @@ use tokio::sync::{broadcast, mpsc};
 /// the answer is built on the request loop, ahead of the next Input frame.
 const TAIL_MAX_BYTES: u32 = 64 * 1024;
 
+/// The Windows accept loop: one connected pipe instance per client (see
+/// `platform::PipeListener`), served exactly as a socket connection is.
+#[cfg(windows)]
+pub async fn accept_loop(daemon: Arc<Daemon>, mut listener: crate::platform::PipeListener) {
+    loop {
+        tokio::select! {
+            _ = daemon.shutdown.cancelled() => break,
+            accepted = listener.accept() => match accepted {
+                Ok(pipe) => {
+                    let daemon = daemon.clone();
+                    tokio::spawn(async move {
+                        let (read_half, write_half) = tokio::io::split(pipe);
+                        if let Err(e) = serve_client(daemon, read_half, write_half).await {
+                            tracing::debug!(error = %e, "client connection ended with error");
+                        }
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "accept failed");
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            },
+        }
+    }
+}
+
+#[cfg(unix)]
 pub async fn accept_loop(daemon: Arc<Daemon>, listener: UnixListener) {
     loop {
         tokio::select! {
@@ -39,8 +68,19 @@ pub async fn accept_loop(daemon: Arc<Daemon>, listener: UnixListener) {
     }
 }
 
+#[cfg(unix)]
 async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
     let (read_half, write_half) = stream.into_split();
+    serve_client(daemon, read_half, write_half).await
+}
+
+/// One client connection, over whichever halves the platform's stream
+/// splits into.
+async fn serve_client<R, W>(daemon: Arc<Daemon>, read_half: R, write_half: W) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
     let mut reader = tokio::io::BufReader::new(read_half);
 
     // Single writer task; everything else sends frames through this channel

@@ -129,6 +129,34 @@ async fn run_program(
     // and the wait below is on the process alone.
     let stdout = tempfile::tempfile().context("hook output file")?;
     let stderr = tempfile::tempfile().context("hook output file")?;
+    // Windows: the hook may be a `.cmd` or `.ps1` as well as an `.exe`, so
+    // it starts the way an agent does (`shell::launch`), with no console
+    // window; a timeout ends its process tree by pid.
+    #[cfg(windows)]
+    let mut child = {
+        let args = [
+            ctx.repo.display().to_string(),
+            ctx.worktree.display().to_string(),
+        ];
+        let launch = nebula_core::shell::launch(program, &args)
+            .map_err(anyhow::Error::msg)
+            .with_context(|| format!("{label} hook `{program}` could not start"))?;
+        tokio::process::Command::new(&launch.program)
+            .args(&launch.args)
+            .envs(launch.env.iter().map(|(k, v)| (k, v)))
+            .env(env::HOOK, label)
+            .env(env::WORKTREE_BRANCH, ctx.branch)
+            .env(env::WORKTREE_ID, ctx.id.as_str())
+            .current_dir(ctx.repo)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(stdout.try_clone()?))
+            .stderr(Stdio::from(stderr.try_clone()?))
+            .creation_flags(nebula_core::platform::NO_WINDOW_FLAGS)
+            .kill_on_drop(true)
+            .spawn()
+            .with_context(|| format!("{label} hook `{program}` could not start"))?
+    };
+    #[cfg(unix)]
     let mut child = tokio::process::Command::new(program)
         .arg(ctx.repo)
         .arg(ctx.worktree)
@@ -193,11 +221,20 @@ async fn run_program(
 /// SIGKILL the hook's whole process group — the script and whatever it
 /// spawned without `exec`. The group id is the hook's own pid
 /// (`process_group(0)` above).
+#[cfg(unix)]
 fn kill_group(child: &tokio::process::Child) {
     use nix::sys::signal::{killpg, Signal};
     use nix::unistd::Pid;
     if let Some(pid) = child.id() {
         let _ = killpg(Pid::from_raw(pid as i32), Signal::SIGKILL);
+    }
+}
+
+/// Windows: end the hook and everything it started, by pid tree.
+#[cfg(windows)]
+fn kill_group(child: &tokio::process::Child) {
+    if let Some(pid) = child.id() {
+        crate::platform::kill_tree(pid);
     }
 }
 
@@ -229,6 +266,7 @@ fn describe(d: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
@@ -255,6 +293,7 @@ mod tests {
         repo
     }
 
+    #[cfg(unix)]
     fn script(dir: &Path, body: &str) -> PathBuf {
         let path = dir.join("hook.sh");
         std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
@@ -288,6 +327,7 @@ mod tests {
     /// Both paths arrive verbatim as `$1`/`$2` (spaces and all), the
     /// branch, id and hook name ride the environment, and the script runs
     /// from the main checkout.
+    #[cfg(unix)]
     #[tokio::test]
     async fn hook_gets_literal_paths_env_and_the_repo_as_cwd() {
         let tmp = tempfile::tempdir().unwrap();
@@ -334,6 +374,7 @@ mod tests {
 
     /// The create key is its own setting: a repo with only a delete hook
     /// runs nothing on create, and the create hook sees its own name.
+    #[cfg(unix)]
     #[tokio::test]
     async fn create_and_delete_keys_are_independent() {
         let tmp = tempfile::tempdir().unwrap();
@@ -368,6 +409,7 @@ mod tests {
     /// A delete hook is for a checkout that is gone; while the directory
     /// is still there (git stopped tracking it and nebula left it alone)
     /// the hook is skipped and the user told, not run against live files.
+    #[cfg(unix)]
     #[tokio::test]
     async fn delete_hook_is_skipped_while_the_directory_exists() {
         let tmp = tempfile::tempdir().unwrap();
@@ -398,6 +440,7 @@ mod tests {
         assert!(!out.exists(), "the hook did not run");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn failing_hook_reports_its_status_and_last_stderr_line() {
         let tmp = tempfile::tempdir().unwrap();
@@ -447,6 +490,7 @@ mod tests {
 
     /// The pid a script wrote to `file`, waiting for it to appear: under a
     /// loaded test runner a shell can take a while to start.
+    #[cfg(unix)]
     async fn pid_in(file: &Path) -> i32 {
         for _ in 0..100 {
             if let Ok(s) = std::fs::read_to_string(file) {
@@ -459,10 +503,12 @@ mod tests {
         panic!("{} was never written", file.display());
     }
 
+    #[cfg(unix)]
     fn alive(pid: i32) -> bool {
         nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
     }
 
+    #[cfg(unix)]
     async fn wait_dead(pid: i32) -> bool {
         for _ in 0..40 {
             if !alive(pid) {
@@ -476,6 +522,7 @@ mod tests {
     /// A script that hangs on a child it did not `exec` — the shape of a
     /// real hook — is killed with that child: the group goes, not just the
     /// script, so "was killed" is the truth.
+    #[cfg(unix)]
     #[tokio::test]
     async fn hook_past_the_timeout_is_killed_with_what_it_started() {
         let tmp = tempfile::tempdir().unwrap();
@@ -516,6 +563,7 @@ mod tests {
     /// A hook that starts something long-lived — a dev server — and exits
     /// 0 is a success the moment it exits, even though its child still
     /// holds the output it inherited; and that child is left running.
+    #[cfg(unix)]
     #[tokio::test]
     async fn backgrounded_child_neither_holds_the_hook_open_nor_dies_with_it() {
         let tmp = tempfile::tempdir().unwrap();

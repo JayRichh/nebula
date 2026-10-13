@@ -8,6 +8,7 @@ pub mod lifecycle;
 pub mod metrics;
 pub mod open_files;
 pub mod orchestrator;
+pub mod platform;
 pub mod pr_scope;
 pub mod prompt_history;
 pub mod pty;
@@ -65,8 +66,26 @@ pub fn run_daemon(opts: DaemonOpts) -> Result<()> {
 }
 
 async fn serve(opts: DaemonOpts) -> Result<()> {
+    #[cfg(unix)]
     use std::os::fd::AsRawFd;
     let sock = paths::socket_path();
+    // Windows: a named pipe instead of the socket, and no IN-PLACE RESTART
+    // to inherit one from.
+    #[cfg(windows)]
+    let (lock, listener, inherited_hooks, carry) = {
+        if opts.adopt.is_some() {
+            bail!("{}", handoff::UNSUPPORTED);
+        }
+        let Some(lock) = lifecycle::PidfileLock::try_acquire()? else {
+            bail!("another nebula daemon is already running");
+        };
+        let pipe = paths::pipe_name();
+        let listener = platform::PipeListener::bind(&pipe)
+            .with_context(|| format!("create pipe {pipe}"))?;
+        tracing::info!(%pipe, "daemon pipe created");
+        (lock, listener, None, None::<handoff::Carry>)
+    };
+    #[cfg(unix)]
     let (lock, listener, inherited_hooks, carry) = match opts.adopt.as_deref() {
         Some(state) => {
             let handoff::Inherited {
@@ -89,6 +108,7 @@ async fn serve(opts: DaemonOpts) -> Result<()> {
             (lock, listener, None, None)
         }
     };
+    #[cfg(unix)]
     let socket_fd = listener.as_raw_fd();
     // Shared with the refresh loop below, and held here until the socket is
     // gone: a new daemon must not take the lock while this one still has a
@@ -147,6 +167,9 @@ async fn serve(opts: DaemonOpts) -> Result<()> {
     // An IN-PLACE RESTART request: a client wrote one and sent SIGWINCH,
     // the signal chosen because its default action is to do nothing, so a
     // daemon too old to listen for it survives being asked.
+    #[cfg(windows)]
+    let _ = (hook_fd, opts.foreground);
+    #[cfg(unix)]
     {
         let daemon = daemon.clone();
         let handles = std::sync::Arc::new(handoff::Handles {
@@ -361,7 +384,32 @@ async fn serve(opts: DaemonOpts) -> Result<()> {
         });
     }
 
+    // Ctrl+C, the console closing, or the session ending → clean shutdown.
+    // A detached daemon has no console and hears none of these; it stops
+    // on a client's `Shutdown` (`nebula kill`).
+    #[cfg(windows)]
+    {
+        let daemon = daemon.clone();
+        tokio::spawn(async move {
+            use tokio::signal::windows::{ctrl_c, ctrl_close, ctrl_shutdown};
+            let (Ok(mut int), Ok(mut close), Ok(mut shutdown)) =
+                (ctrl_c(), ctrl_close(), ctrl_shutdown())
+            else {
+                tracing::warn!("console control handlers unavailable");
+                return;
+            };
+            tokio::select! {
+                _ = int.recv() => {}
+                _ = close.recv() => {}
+                _ = shutdown.recv() => {}
+            }
+            tracing::info!("console control event received; shutting down");
+            daemon.shutdown.cancel();
+        });
+    }
+
     // SIGTERM/SIGINT → clean shutdown.
+    #[cfg(unix)]
     {
         let daemon = daemon.clone();
         tokio::spawn(async move {

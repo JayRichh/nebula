@@ -6,7 +6,28 @@
 use nebula_core::{MetricsSnapshot, PrewarmInfo, SessionMetrics, SessionRef};
 use std::collections::{HashMap, HashSet};
 
+/// Take one reading. Blocking (a toolhelp snapshot, then one working-set
+/// query per process); call via spawn_blocking. The table is rendered in
+/// `ps`'s shape so the same pure core reads it.
+#[cfg(windows)]
+pub fn collect(sessions: Vec<(SessionRef, u32, Option<PrewarmInfo>)>) -> MetricsSnapshot {
+    use std::fmt::Write;
+    let mut table = String::new();
+    for row in nebula_core::platform::process_table() {
+        // A process this user may not query still links its children in.
+        let kb = nebula_core::platform::process_rss_bytes(row.pid).unwrap_or(0) / 1024;
+        let _ = writeln!(table, "{} {} {kb}", row.pid, row.ppid);
+    }
+    snapshot_from_table(
+        &table,
+        std::process::id(),
+        &sessions,
+        nebula_core::mem::system_total_bytes().unwrap_or(0),
+    )
+}
+
 /// Take one reading. Blocking (shells out to `ps`); call via spawn_blocking.
+#[cfg(unix)]
 pub fn collect(sessions: Vec<(SessionRef, u32, Option<PrewarmInfo>)>) -> MetricsSnapshot {
     let table = std::process::Command::new("ps")
         .args(["-axo", "pid=,ppid=,rss="])
