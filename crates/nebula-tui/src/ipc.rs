@@ -480,7 +480,7 @@ pub async fn open_files_for_current_agent(files: &[String]) -> Result<()> {
     }
     let mut resolved = Vec::with_capacity(files.len());
     for file in files {
-        let path = std::fs::canonicalize(file)
+        let path = paths::canonical(std::path::Path::new(file))
             .with_context(|| format!("can't open {file}: no such file"))?;
         if !path.is_file() {
             bail!("can't open {file}: not a file");
@@ -1037,7 +1037,7 @@ pub async fn add_project(path: &str) -> Result<()> {
         (Some(rest), Some(home)) => home.join(rest),
         _ => std::path::PathBuf::from(path),
     };
-    let dir = std::fs::canonicalize(&expanded)
+    let dir = paths::canonical(&expanded)
         .with_context(|| format!("{} does not exist", expanded.display()))?;
     if !dir.is_dir() {
         bail!("{} is not a directory", dir.display());

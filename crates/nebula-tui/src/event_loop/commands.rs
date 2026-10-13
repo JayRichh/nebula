@@ -132,7 +132,7 @@ fn dispatch_prompt(
         PromptKind::AddProject => open_folder(app, shellexpand_home(&value), out),
         PromptKind::SetProjectPath { id, old_path } => {
             let typed = shellexpand_home(&value);
-            let path = std::fs::canonicalize(&typed).unwrap_or(typed);
+            let path = nebula_core::paths::canonical(&typed).unwrap_or(typed);
             let intent = PendingIntent::ProjectPathSet {
                 project: id.clone(),
                 old_path: old_path.clone(),

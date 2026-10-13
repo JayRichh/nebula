@@ -687,7 +687,7 @@ pub(crate) fn sanitize_title(raw: &str) -> String {
 /// when it doesn't resolve (deleted checkout, not-yet-created dir). macOS
 /// symlinks (`/tmp` → `/private/tmp`) otherwise break `starts_with`.
 fn canonical_or_raw(path: &Path) -> std::path::PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    nebula_core::paths::canonical(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// Does this agent still have a backgrounded tool call running — a job it

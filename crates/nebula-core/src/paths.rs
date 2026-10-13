@@ -127,6 +127,28 @@ pub fn pidfile_path() -> PathBuf {
     runtime_dir().join("daemon.pid")
 }
 
+/// `std::fs::canonicalize`, minus the verbatim prefix Windows puts on the
+/// result (`\\?\C:\repo`, `\\?\UNC\host\share`). Paths nebula stores and
+/// compares come from git, hook payloads and the user as well, all in the
+/// plain form, and a verbatim path equals none of them.
+pub fn canonical(path: &Path) -> std::io::Result<PathBuf> {
+    let canon = std::fs::canonicalize(path)?;
+    #[cfg(windows)]
+    {
+        let text = canon.to_string_lossy();
+        if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+            return Ok(PathBuf::from(format!(r"\\{rest}")));
+        }
+        if let Some(rest) = text.strip_prefix(r"\\?\") {
+            let bytes = rest.as_bytes();
+            if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+                return Ok(PathBuf::from(rest));
+            }
+        }
+    }
+    Ok(canon)
+}
+
 /// The file a Windows daemon holds its lock on, beside `pidfile`. Windows
 /// locks are mandatory — a locked file cannot be read through another
 /// handle — so the lock lives apart from the pid clients read.
@@ -357,6 +379,18 @@ mod tests {
             assert!(runtime_dir().ends_with(r"bro\run"), "{}", runtime_dir().display());
             assert_eq!(log_dir(), data_dir().join("state"));
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn canonical_paths_drop_the_verbatim_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let canon = canonical(dir.path()).unwrap();
+        assert!(!canon.to_string_lossy().starts_with(r"\\?\"), "{}", canon.display());
+        assert!(canon.is_absolute() && canon.is_dir());
+        // The same directory spelled with git's `/` compares equal to it.
+        let slashed = PathBuf::from(canon.to_string_lossy().replace('\\', "/"));
+        assert_eq!(canonical(&slashed).unwrap(), canon);
     }
 
     #[test]

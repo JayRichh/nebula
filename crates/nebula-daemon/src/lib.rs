@@ -486,7 +486,7 @@ fn git_common_dir(repo_path: &std::path::Path) -> Option<std::path::PathBuf> {
         Ok(common) => rebase_on(&git_dir, common.trim()),
         Err(_) => git_dir,
     };
-    Some(std::fs::canonicalize(&common).unwrap_or(common))
+    Some(paths::canonical(&common).unwrap_or(common))
 }
 
 /// Git writes these pointers as either an absolute path or one relative to the

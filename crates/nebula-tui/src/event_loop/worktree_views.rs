@@ -28,7 +28,7 @@ pub(crate) fn open_folder(app: &mut App, path: std::path::PathBuf, out: &mut Vec
         }));
         return;
     }
-    let canon = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+    let canon = nebula_core::paths::canonical(&path).unwrap_or_else(|_| path.clone());
     let known = canon
         .ancestors()
         .find_map(|dir| app.tree.project_at_path(dir))
