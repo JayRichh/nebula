@@ -68,7 +68,15 @@ fn wsl_flavor_from(osrelease: Option<&str>, version: Option<&str>) -> Option<Wsl
     }
 }
 
+/// Windows keeps the machine name in `%COMPUTERNAME%`; winsock's
+/// `gethostname` would need the socket library started first.
+#[cfg(windows)]
+fn gethostname_syscall() -> Option<String> {
+    crate::env::non_empty("COMPUTERNAME")
+}
+
 // Avoid a libc dependency in this dep-light crate for one call.
+#[cfg(unix)]
 fn gethostname_syscall() -> Option<String> {
     extern "C" {
         fn gethostname(name: *mut core::ffi::c_char, len: usize) -> i32;

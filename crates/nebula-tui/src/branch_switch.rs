@@ -69,6 +69,7 @@ const SIZE: (u16, u16) = (92, 24);
 const FETCH_TIMEOUT: Duration = Duration::from_secs(120);
 /// Between the SIGTERM that lets git remove its lock and temporary pack
 /// files and the SIGKILL for a fetch that lingers.
+#[cfg_attr(windows, allow(dead_code))]
 const FETCH_GRACE: Duration = Duration::from_secs(2);
 /// The least time between two background fetches of one checkout, so
 /// opening and closing the modal never hammers a remote.
@@ -80,10 +81,13 @@ const REF_FORMAT: &str = "--format=%(refname)%00%(symref)%00%(HEAD)%00%(worktree
 /// argument-length limit.
 const PATH_CHUNK: usize = 200;
 
+#[cfg(unix)]
 extern "C" {
     fn kill(pid: i32, sig: i32) -> i32;
 }
+#[cfg(unix)]
 const SIGTERM: i32 = 15;
+#[cfg(unix)]
 const SIGKILL: i32 = 9;
 
 // ---- width ----
@@ -314,6 +318,7 @@ pub fn fetch(root: &Path, quit: &AtomicBool) -> bool {
 /// End a fetch and the `ssh` it may have started, which share its session
 /// and so its process group: SIGTERM first, so git cleans up its lock and
 /// temporary pack files, and SIGKILL only for one that lingers.
+#[cfg(unix)]
 fn stop(child: &mut std::process::Child) {
     let group = -(child.id() as i32);
     // SAFETY: plain syscalls on a process group this process started and
@@ -327,6 +332,21 @@ fn stop(child: &mut std::process::Child) {
         std::thread::sleep(Duration::from_millis(20));
     }
     unsafe { kill(group, SIGKILL) };
+    let _ = child.wait();
+}
+
+/// Windows: no polite signal to send a console-less git, so the fetch and
+/// whatever it started (its `ssh`) are ended by pid tree.
+#[cfg(windows)]
+fn stop(child: &mut std::process::Child) {
+    use std::os::windows::process::CommandExt;
+    let _ = Command::new("taskkill")
+        .args(["/T", "/F", "/PID", &child.id().to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
+        .status();
     let _ = child.wait();
 }
 
