@@ -65,6 +65,10 @@ pub const CLAUDE_CONFIG_DIR: &str = "CLAUDE_CONFIG_DIR";
 /// its hooks.
 pub const CODEX_HOME: &str = "CODEX_HOME";
 
+/// Windows only: the shell plain terminals and RUN TERMINALs use, ahead of
+/// the pwsh → powershell → `%COMSPEC%` search (`shell::user_shell`).
+pub const SHELL_OVERRIDE: &str = "BRO_SHELL";
+
 /// Env vars that identify an agent session to the daemon. They are set on
 /// every agent PTY and must never leak into plain terminals.
 pub const AGENT_SESSION_VARS: &[&str] = &[AGENT_ID, API_URL, API_TOKEN];
@@ -176,8 +180,20 @@ pub fn non_empty(var: &str) -> Option<String> {
 
 /// `$HOME`, when the environment has one. Read as an `OsString` so a
 /// non-UTF-8 home still resolves — every `~/` expansion goes through here.
+#[cfg(unix)]
 pub fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
+}
+
+/// `%HOME%` when something set one (Git Bash, MSYS), else the profile dir
+/// Windows itself keeps in `%USERPROFILE%` — where `~/.claude` and
+/// `~/.codex` live for the native CLIs.
+#[cfg(windows)]
+pub fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
 }
 
 #[cfg(test)]

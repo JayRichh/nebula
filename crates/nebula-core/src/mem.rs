@@ -4,6 +4,19 @@
 //! its own RSS there too — the footer's readout asks every five seconds.
 
 /// Resident set size of one process, bytes.
+#[cfg(windows)]
+pub fn process_rss_bytes(pid: u32) -> Option<u64> {
+    crate::platform::process_rss_bytes(pid)
+}
+
+/// Physical memory installed on this machine, bytes.
+#[cfg(windows)]
+pub fn system_total_bytes() -> Option<u64> {
+    crate::platform::system_total_bytes()
+}
+
+/// Resident set size of one process, bytes.
+#[cfg(unix)]
 pub fn process_rss_bytes(pid: u32) -> Option<u64> {
     let out = std::process::Command::new("ps")
         .args(["-o", "rss=", "-p", &pid.to_string()])
@@ -14,6 +27,7 @@ pub fn process_rss_bytes(pid: u32) -> Option<u64> {
 }
 
 /// Physical memory installed on this machine, bytes.
+#[cfg(unix)]
 pub fn system_total_bytes() -> Option<u64> {
     #[cfg(target_os = "macos")]
     {

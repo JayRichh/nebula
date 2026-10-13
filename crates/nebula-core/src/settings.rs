@@ -332,6 +332,7 @@ mod tests {
         assert!(loaded.problems.is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_write_goes_through_a_symlink_instead_of_replacing_it() {
         let dir = tempfile::tempdir().unwrap();

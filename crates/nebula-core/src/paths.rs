@@ -10,11 +10,13 @@ pub const SSH_HOSTS_FILE_NAME: &str = "ssh_hosts.json";
 
 /// Where the runtime dir lands when neither override nor `XDG_RUNTIME_DIR`
 /// is set. World-writable, so the per-uid subdir is what carries mode 0700.
+#[cfg(unix)]
 const FALLBACK_RUNTIME_ROOT: &str = "/tmp";
 
 /// Runtime dir holding the socket + pidfile. Mode 0700 — this is the auth
 /// boundary, same model as tmux. `NEBULA_RUNTIME_DIR` overrides (tests,
 /// parallel instances).
+#[cfg(unix)]
 pub fn runtime_dir() -> PathBuf {
     if let Some(dir) = env::non_empty(env::RUNTIME_DIR) {
         return PathBuf::from(dir);
@@ -25,6 +27,73 @@ pub fn runtime_dir() -> PathBuf {
     fallback_runtime_dir()
 }
 
+/// Runtime dir holding the pidfile and buildstamp: `%LOCALAPPDATA%\bro\run`.
+/// The daemon's endpoint is a named pipe, not a file in here, but its name
+/// is derived from this dir ([`pipe_name`]), so `NEBULA_RUNTIME_DIR` still
+/// isolates tests and parallel instances. The per-user profile is the
+/// access boundary; there is no mode to set.
+#[cfg(windows)]
+pub fn runtime_dir() -> PathBuf {
+    if let Some(dir) = env::non_empty(env::RUNTIME_DIR) {
+        return PathBuf::from(dir);
+    }
+    windows_app_dir().join("run")
+}
+
+/// `%LOCALAPPDATA%\bro`, the root of everything the Windows build keeps.
+/// Local rather than roaming: the database, logs and pidfile describe this
+/// machine's sessions and must not follow a roaming profile elsewhere.
+#[cfg(windows)]
+fn windows_app_dir() -> PathBuf {
+    env::non_empty("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .or_else(|| env::home_dir().map(|home| home.join("AppData").join("Local")))
+        .unwrap_or_else(std::env::temp_dir)
+        .join("bro")
+}
+
+/// The named pipe the daemon listens on for `runtime_dir`, as `user`:
+/// `\\.\pipe\bro-<user>-<hash>`. Pipe names are machine-global, so the user
+/// keeps two accounts apart and the hash of the runtime dir keeps apart two
+/// instances one user runs (`NEBULA_RUNTIME_DIR`). The hash is FNV-1a over
+/// the path's bytes: fixed across builds and toolchains, so a client and a
+/// daemon from different builds still agree on the name.
+pub fn pipe_name_for(user: &str, runtime_dir: &Path) -> String {
+    const PRIME: u64 = 0x100_0000_01b3;
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in runtime_dir.to_string_lossy().bytes() {
+        hash = (hash ^ u64::from(byte)).wrapping_mul(PRIME);
+    }
+    // Pipe names take any character but `\`; keep the user part tame anyway
+    // so the name reads cleanly in tools that list pipes.
+    let user: String = user
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!(r"\\.\pipe\bro-{user}-{:08x}", hash as u32)
+}
+
+/// [`pipe_name_for`] the current user and a socket path: the pipe stands in
+/// for the socket that would sit at `socket`, so its dir picks the pipe.
+pub fn pipe_name_for_socket(socket: &Path) -> String {
+    let user = env::non_empty("USERNAME")
+        .or_else(|| env::non_empty("USER"))
+        .unwrap_or_else(|| "user".into());
+    pipe_name_for(&user, socket.parent().unwrap_or(Path::new("")))
+}
+
+/// The daemon's named pipe for this user and [`runtime_dir`].
+pub fn pipe_name() -> String {
+    pipe_name_for_socket(&socket_path())
+}
+
+#[cfg(unix)]
 fn xdg_runtime_dir() -> Option<PathBuf> {
     let dir = PathBuf::from(env::non_empty("XDG_RUNTIME_DIR")?);
     // XDG_RUNTIME_DIR is supposed to be created by the login manager before
@@ -35,12 +104,14 @@ fn xdg_runtime_dir() -> Option<PathBuf> {
     dir.is_dir().then_some(dir)
 }
 
+#[cfg(unix)]
 fn fallback_runtime_dir() -> PathBuf {
     let uid = libc_geteuid();
     Path::new(FALLBACK_RUNTIME_ROOT).join(format!("nebula-{uid}"))
 }
 
 // Avoid a libc dependency in this dep-light crate for one call.
+#[cfg(unix)]
 fn libc_geteuid() -> u32 {
     extern "C" {
         fn geteuid() -> u32;
@@ -90,10 +161,12 @@ pub fn restart_state_path() -> PathBuf {
 
 /// The platform's per-user dirs for this app (`~/Library/Application
 /// Support/dev.nebula.nebula` on macOS, `~/.local/share/nebula` on Linux).
+#[cfg(unix)]
 fn project_dirs() -> Option<directories::ProjectDirs> {
     directories::ProjectDirs::from("dev", "nebula", "nebula")
 }
 
+#[cfg(unix)]
 pub fn data_dir() -> PathBuf {
     if let Some(dir) = env::non_empty(env::DATA_DIR) {
         return PathBuf::from(dir);
@@ -101,6 +174,17 @@ pub fn data_dir() -> PathBuf {
     project_dirs()
         .map(|d| d.data_dir().to_path_buf())
         .unwrap_or_else(|| env::home_dir().unwrap_or_default().join(".nebula"))
+}
+
+/// `%LOCALAPPDATA%\bro\data`, beside the runtime dir, rather than the
+/// roaming `%APPDATA%` dir `ProjectDirs` would pick: the database holds
+/// this machine's sessions and checkouts.
+#[cfg(windows)]
+pub fn data_dir() -> PathBuf {
+    if let Some(dir) = env::non_empty(env::DATA_DIR) {
+        return PathBuf::from(dir);
+    }
+    windows_app_dir().join("data")
 }
 
 pub fn db_path() -> PathBuf {
@@ -135,6 +219,14 @@ pub fn claude_config_dir() -> Option<PathBuf> {
         .or_else(|| env::home_dir().map(|home| home.join(".claude")))
 }
 
+/// Logs live under the data dir's `state` on Windows, which has no separate
+/// state dir.
+#[cfg(windows)]
+pub fn log_dir() -> PathBuf {
+    data_dir().join("state")
+}
+
+#[cfg(unix)]
 pub fn log_dir() -> PathBuf {
     // Tests and parallel instances override the data dir; keep their logs
     // beside their data instead of the real user's state dir.
@@ -240,12 +332,46 @@ mod tests {
             data_dir().display()
         );
 
-        let xdg = std::env::temp_dir().join(format!("nebula-paths-xdg-{}", std::process::id()));
-        std::fs::create_dir_all(&xdg).unwrap();
-        std::env::set_var("XDG_RUNTIME_DIR", &xdg);
-        assert_eq!(runtime_dir(), xdg.join("nebula"));
+        #[cfg(unix)]
+        {
+            let xdg =
+                std::env::temp_dir().join(format!("nebula-paths-xdg-{}", std::process::id()));
+            std::fs::create_dir_all(&xdg).unwrap();
+            std::env::set_var("XDG_RUNTIME_DIR", &xdg);
+            assert_eq!(runtime_dir(), xdg.join("nebula"));
 
-        std::fs::remove_dir_all(&xdg).unwrap();
-        assert_eq!(runtime_dir(), fallback_runtime_dir());
+            std::fs::remove_dir_all(&xdg).unwrap();
+            assert_eq!(runtime_dir(), fallback_runtime_dir());
+        }
+        #[cfg(windows)]
+        {
+            // Both defaults sit side by side under one `bro` dir.
+            assert_eq!(runtime_dir().parent(), data_dir().parent());
+            assert!(runtime_dir().ends_with(r"bro\run"), "{}", runtime_dir().display());
+            assert_eq!(log_dir(), data_dir().join("state"));
+        }
+    }
+
+    #[test]
+    fn pipe_name_is_per_user_and_per_runtime_dir() {
+        let a = Path::new(r"C:\Users\jay\AppData\Local\bro\run");
+        let b = Path::new(r"C:\Temp\test-run");
+        let name = pipe_name_for("jay", a);
+        assert!(name.starts_with(r"\\.\pipe\bro-jay-"), "{name}");
+        assert_eq!(name.len(), r"\\.\pipe\bro-jay-".len() + 8, "{name}");
+        // Stable for the same inputs, so client and daemon agree.
+        assert_eq!(name, pipe_name_for("jay", a));
+        assert_ne!(name, pipe_name_for("jay", b), "runtime dirs isolate");
+        assert_ne!(name, pipe_name_for("ann", a), "users isolate");
+        // A user name with characters a pipe listing would mangle.
+        let odd = pipe_name_for(r"DOMAIN\Jay Smith", a);
+        assert!(odd.starts_with(r"\\.\pipe\bro-DOMAIN_Jay_Smith-"), "{odd}");
+        assert_eq!(odd.matches('\\').count(), 4, "only the prefix's: {odd}");
+        // The socket path's dir picks the pipe: tests that put a socket in
+        // a temp dir get a pipe of their own.
+        assert_eq!(
+            pipe_name_for_socket(&b.join("daemon.sock")),
+            pipe_name_for_socket(&b.join("other.sock"))
+        );
     }
 }
